@@ -50,13 +50,15 @@
 
 ## Configuration Management
 - **Format**: YAML files (e.g., `config.yaml`) for LLM keys, RabbitMQ credentials, and deployment modes
-- **Secrets**: Managed via environment variables
+- **Secrets**: Managed via environment variables or .env files
 
 ## Microservice Components
-- **CLI Client**:
+
+**CLI Client**:
   - User-facing, sends JSON messages to RabbitMQ (e.g., `{"ip": "192.168.1.1"}`)
   - Listens to `recon_results` for reports/shell info
-- **Backend Service**:
+
+**Backend Service**:
   - Consumes `recon_requests`, initializes LangGraph state
   - Uses configured LLM for agents
   - Executes containerized tools, analyzes output, and publishes results
@@ -65,12 +67,14 @@
 <h1 align="center">Dvelopment Phases</h1>
 
 ### Phase 1: Core Setup and Local Development (2-3 weeks)
-- **Repo Structure**:
+
+**Repo Structure**:
   - `/cli`: Go-based CLI
   - `/backend`: Python backend
   - `/docker`: Docker images and scripts
   - `/config`: YAML configuration files
-- **Tasks**:
+
+**Tasks**:
   - Basic RabbitMQ integration: CLI publisher/consumer, backend consumer echoing messages
   - LangGraph skeleton: Define state, add planning node with AutoGen (using dummy LLM)
   - LLM toggle: Test with Ollama locally and a commercial API
@@ -78,7 +82,8 @@
   - Test message flow and container execution via CLI
 
 ### Phase 2: Recon Logic and Tool Integration (3-4 weeks)
-- **Tasks**:
+
+**Tasks**:
   - Expand LangGraph: Add nodes for scanning, vulnerability assessment, and exploitation (all containerized)
   - Integrate tools: Nmap and Metasploit in Kali containers
   - Handle shell attempts (e.g., Metasploit reverse shell listener in container, proxy output)
@@ -87,14 +92,16 @@
   - Ensure seamless LLM switching (commercial for speed, local for privacy)
 
 ### Phase 3: Microservice Polish and Security (2-3 weeks)
-- **Tasks**:
+
+**Tasks**:
   - Add RabbitMQ features: Queues, acknowledgments, and dead-letter queues for errors
   - Implement logging/monitoring: Backend `/health` endpoint, log container outputs
   - Security audit: Ensure no host execution of tools, add queue rate limiting
   - CLI enhancements: Progress updates via status queue, handle timeouts
 
 ### Phase 4: Deployment and Testing (1-2 weeks)
-- **Tasks**:
+
+**Tasks**:
   - Deployment strategies (see below)
   - End-to-end testing with safe IPs and mock containers
   - Stress test with multiple requests
