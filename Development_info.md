@@ -108,14 +108,16 @@
 
 <h1 align="center">Deployment Strategies</h1>
 
-### Shared Foundation
-- **Containerization**:
-  - Dockerfile for CLI (as binary), backend (Python app), RabbitMQ (official image), and Ollama
-- **Local/Dev**: Docker Compose with a single `docker-compose.yml` to spin up all services
-- **Production**: Kubernetes manifests for pods (backend deployment, RabbitMQ statefulset)
-
 ### On-Premise Deployment
 - **Hardware**: Local machine or VM with Docker/K8s
 - **Setup**: Docker Compose for simplicity (`docker-compose up`)
 - **LLM**: Local models via Ollama container (e.g., Llama3)
 - **Access**: CLI runs on user’s
+
+### Cloud Deployment: 
+- **Platform**: Azure (VMs/AKS).
+- **Managed Services**: Amazon MQ (for RabbitMQ).
+- **LLM**: Commercial APIs (config points to endpoints).
+- **Orchestration**: Kubernetes (AKS) for auto-scaling backend pods based on queue length.
+- **CI/CD**: Not considered as of right now, will be addressed later in the development.
+- **Monitoring**: Not considered as of right now, will be addressed later in the development.
