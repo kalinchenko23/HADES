@@ -1,0 +1,36 @@
+services:
+  rabbitmq:
+    image: rabbitmq:management
+    ports:
+      - "5672:5672"
+      - "15672:15672"  # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+
+# This block is for ollama server running inside the container
+  # ollama:
+  #   image: ollama/ollama
+  #   ports:
+  #     - "11434:11434"  # Ollama API
+  #   volumes:
+  #     - ollama_data:/root/.ollama  # Persist models
+  #   # Optional GPU support (uncomment if needed)
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  backend:
+    build: ./backend
+    depends_on:
+      - rabbitmq
+      - ollama
+    volumes:
+      - ./backend:/app
+    command: poetry run python main.py # Your backend entrypoint
+
+volumes:
+  ollama_data:
