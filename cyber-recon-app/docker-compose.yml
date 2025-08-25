@@ -23,14 +23,14 @@ services:
   #           - driver: nvidia
   #             count: all
   #             capabilities: [gpu]
-  backend:
-    build: ./backend
-    depends_on:
-      - rabbitmq
-      - ollama
-    volumes:
-      - ./backend:/app
-    command: poetry run python main.py # Your backend entrypoint
+#   backend:
+#     build: ./backend
+#     depends_on:
+#       - rabbitmq
+#       - ollama
+#     volumes:
+#       - ./backend:/app
+#     command: poetry run python main.py # Your backend entrypoint
 
-volumes:
-  ollama_data:
+# volumes:
+#   ollama_data:

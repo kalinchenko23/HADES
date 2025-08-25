@@ -4,7 +4,7 @@ from graph import app
 
 # Placeholder for LangGraph (expanded in next steps)
 def process_recon(data):
-    result=app.invoke({"ip": data['ip']})['result']
+    result=app.invoke({"ip": data['ip'], "llm_provider" : data["llm_provider"],"api_key" : data["api_key"],"local_model" : data["local_model"]})['result']
     return result
 
 connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))

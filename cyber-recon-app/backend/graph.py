@@ -4,32 +4,28 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 import autogen
 import docker
-import yaml
 
-# Opening and parsing config file
-with open('../config/config.yaml') as config_file:
-    config=yaml.safe_load(config_file)
-
-# Setting LLM provider
-llm_provider = config['llm']['provider']
 
 # Function that chooses model based on the provider
-def choose_llm(provider=llm_provider):
-    if provider=="ollama":
-        return [{"model": config['llm']['local_model'], "base_url": "http://localhost:11434/v1", "api_key": "NULL"}]
-    elif provider=="":
-        return [{"model": "GPT-4 mini", "api_key": config['llm']['api_key']}]
+def choose_llm(llm_provider,api_key,local_model):
+    if llm_provider=="ollama":
+        return [{"model": local_model, "base_url": "http://localhost:11434/v1", "api_key": "NULL"}]
+    elif llm_provider=="":
+        return [{"model": "GPT-4 mini", "api_key": api_key}]
     
 class ReconState(TypedDict):
     ip: str
+    llm_provider: str
+    api_key: str
+    local_model: str
     messages: Annotated[list, add_messages]
     result: dict
 
 # Creating a dummy AutoGen node for now
 def planning_node(state: ReconState) -> ReconState:
-    config_list = choose_llm()  # Placeholder LLM
+    config_list = choose_llm(state['llm_provider'],state['api_key'],state['local_model'])  # Placeholder LLM       
     planner = autogen.AssistantAgent(name="Planner", llm_config={"config_list": config_list})
-    user_proxy = autogen.UserProxyAgent(name="UserProxy", human_input_mode="NEVER", code_execution_config={"use_docker": False})
+    user_proxy = autogen.UserProxyAgent(name="UserProxy", human_input_mode="NEVER")
     user_proxy.initiate_chat(planner, message=f"Plan for IP: {state['ip']}")
     state['messages'] = user_proxy.chat_messages[planner]
     state['result'] = {"plan": "Dummy plan complete"}
