@@ -52,7 +52,7 @@ func (c *LLMConfig) Validate() []ValidationError {
 			Message: "provider is required",
 		})
 
-		// Validate provider for validity
+	// Validate provider for validity
 	} else {
 		validProviders := []string{"ollama", "openai", "anthropic", "azure", "grok"}
 		if !llmpPoviderContains(validProviders, c.Provider) {
@@ -64,14 +64,14 @@ func (c *LLMConfig) Validate() []ValidationError {
 
 	}
 
-	// Validate provider for presence
+	// Validate api_key for presence
 	if c.APIKey == "" {
 		errors = append(errors, ValidationError{
 			Field:   "api_key",
 			Message: "api_key is required",
 		})
 
-		// Validate provider for validity (if less than 12 most likeley a placeholder)
+	// Validate api_key for validity (if less than 12 most likeley a placeholder)
 	} else if len(c.APIKey) < 8 {
 		errors = append(errors, ValidationError{
 			Field:   "api_key",
@@ -120,12 +120,12 @@ func ParseAndValidateJSON(jsonData []byte) (*LLMConfig, []ValidationError, error
 		}
 	}
 
-	//SECTION2: Checks JSON structure
+	//SECTION2: Checks JSON fields validity
 	var config LLMConfig
 	if err := json.Unmarshal(jsonData, &config); err != nil {
 		return nil, nil, fmt.Errorf("failed to parse JSON: %w", err)
 	}
-	// Validate the structure by calling Validate method on LLMConfig structure
+	// Validate the fields by calling Validate method on LLMConfig structure
 	validationErrors := config.Validate()
 
 	return &config, validationErrors, nil
@@ -146,9 +146,10 @@ func validateIP(ip string) bool {
 
 func main() {
 	app := &cli.App{
-		//EnableBashCompletion: true,
 		Name:  "HADES",
 		Usage: "This tool is designed for reconnaissance and, under ideal circumstances, can establish a shell. At the very least, it will generate a detailed report.",
+		
+		//Defining main command and supporting arguments 
 		Commands: []*cli.Command{
 			{
 				Name: "recon",
@@ -162,6 +163,7 @@ func main() {
 					},
 				},
 
+				//Defining action that should be taken upon calling the command
 				Action: func(c *cli.Context) error {
 
 					//opening JSON file
@@ -190,7 +192,7 @@ func main() {
 						return nil
 					}
 
-					//setting up rebbit
+					//Setting up rebbitMQ
 					conn, err := amqp091.Dial("amqp://guest:guest@localhost:5672/")
 					if err != nil {
 						failOnError(err, "Failed to connect to RabbitMQ")
@@ -198,7 +200,7 @@ func main() {
 					}
 					defer conn.Close()
 
-					//connecting to a channel
+					//Connecting to a rebbitMQ channel
 					ch, err := conn.Channel()
 					if err != nil {
 						failOnError(err, "Failed to connect to RabbitMQ channel")
@@ -206,7 +208,7 @@ func main() {
 					}
 					defer ch.Close()
 
-					// Declare queues args: name, durable, delete when unused, exclusive, no waint, arguments
+					//Declare queues args: name, durable, delete when unused, exclusive, no waint, arguments
 					_, err = ch.QueueDeclare("recon_requests", true, false, false, false, nil)
 					if err != nil {
 						failOnError(err, "Failed to create to recon_requests queu")
@@ -218,7 +220,7 @@ func main() {
 						return nil
 					}
 
-					// Publish
+					//Publish tp rebbitMQ queue
 					msg := map[string]string{"ip": c.String("ip"), "llm_provider": llm_config.Provider, "api_key": llm_config.APIKey, "local_model": llm_config.LocalModel}
 					body, _ := json.Marshal(msg)
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -235,7 +237,7 @@ func main() {
 					}
 					fmt.Println("Request sent. Waiting for results...")
 
-					// Consume (blocking for simplicity)
+					//Consume from rebbitMQ queue(blocking for simplicity)
 					msgs, err := ch.Consume("recon_results", "", true, false, false, false, nil)
 					if err != nil {
 						failOnError(err, "Failed to consume message")
@@ -250,5 +252,8 @@ func main() {
 			},
 		},
 	}
-	app.Run(os.Args)
+	//Calling the cli app
+	if err := app.Run(os.Args); err != nil {
+		fmt.Println(err)
+	}
 }
