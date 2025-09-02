@@ -1,6 +1,6 @@
 module cyber-recon-cli
 
-go 1.24.3
+go 1.24
 
 require (
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect

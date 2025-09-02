@@ -1,5 +1,6 @@
 import json
 import pika
+import time
 from graph import app
 
 # Placeholder for LangGraph (expanded in next steps)
@@ -7,8 +8,20 @@ def process_recon(data):
     result=app.invoke({"ip": data['ip'], "llm_provider" : data["llm_provider"],"api_key" : data["api_key"],"local_model" : data["local_model"]})['result']
     return result
 
-connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+# This function is responsible for connecting to the RabbitMQ 
+def connect_with_retry():
+    for _ in range(5):
+        try:
+            return pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+        except pika.exceptions.AMQPConnectionError:
+            time.sleep(2)
+    raise Exception("Failed to connect to RabbitMQ")
+
+
+connection = connect_with_retry()
 channel = connection.channel()
+
+# Declaring queues
 channel.queue_declare(queue='recon_requests', durable=True)
 channel.queue_declare(queue='recon_results', durable=True)
 
