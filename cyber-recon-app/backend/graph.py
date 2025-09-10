@@ -1,284 +1,693 @@
-from typing import TypedDict, Annotated, List, Dict
-from langchain_openai import OpenAI
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-import autogen
-import docker
-import time
-import nmap
-from pymetasploit3.msfrpc import MsfRpcClient
+from typing import TypedDict, Annotated, List, Dict, Optional
+from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 from langchain_ollama import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+import docker
+import time
+import json
+from pymetasploit3.msfrpc import MsfRpcClient
 
-#State class that will be accessed and modified by nodes 
+# Enhanced State class with better typing
 class ReconState(TypedDict):
     ip: str
     user_input: str
-    scan_results: Dict[str, str] # e.g., {"nmap": "ports open: 22,80"}
-    vulns: List[str] # List of detected vulnerabilities
-    exploitation_attempt: bool # Did we try to get a shell?
-    shell_success: bool # Did shell succeed?
-    report: str  # Final report
+    plan: str
+    vulns: List[str]
+    exploitation_attempt: bool
+    shell_success: bool
+    report: str
     llm_provider: str
     api_key: str
-    local_model: str 
-    messages: Annotated[list, add_messages] # AutoGen chat history
+    local_model: str
+    messages: Annotated[List[BaseMessage], add_messages]
+    current_step: str
+    errors: List[str]
+    # Below are scanning node related fields
+    scan_results: Dict[str, str] 
+    scan_progression: List[str]
+    discovered_services: Dict[str, List[str]]
+    max_scan_iterations: int
 
-
-# Function that chooses model based on the provider
-def choose_llm(llm_provider,api_key,local_model):
-    if llm_provider=="ollama":
-        return [{"model": local_model, "base_url": "http://localhost:11434/v1", "api_key": "NULL"}]
-    elif llm_provider=="":
-        return [{"model": "GPT-4 mini", "api_key": api_key}]
+# LLM Configuration
+def get_llm(llm_provider: str, api_key: str, local_model: str = None):
+    """Factory function to create appropriate LLM instance"""
+    if llm_provider == "ollama":
+        return ChatOllama(
+            model=local_model or "llama2",
+            base_url="http://localhost:11434"
+        )
+    elif llm_provider == "gemini":
+        return ChatGoogleGenerativeAI(
+            model="gemini-pro",
+            google_api_key=api_key
+        )
+    elif llm_provider == "openai":
+        return ChatOpenAI(
+            model="gpt-5-mini",
+            openai_api_key=api_key
+        )
+    elif llm_provider == "groq":
+        return ChatGroq(
+            model="mixtral-8x7b-32768",
+            groq_api_key=api_key
+        )
     else:
         raise ValueError(f"Unsupported LLM provider: {llm_provider}")
 
-# AutoGen planning node
-def planning_node(state: ReconState) -> ReconState:
-    config_list = choose_llm(state['llm_provider'],state['api_key'],state['local_model'])       
-    # Initializing planner
-    planner = autogen.AssistantAgent(
-        name="Planner", 
-        llm_config={"config_list": config_list},
-        system_message="Plan reconnaissance steps for the given IP.")
-    
-    # Initializing ethics 
-    ethics = autogen.AssistantAgent(
-        name="EthicsChecker",
-        llm_config={"config_list": config_list},
-        system_message="Ensure actions are authorized and ethical. Confirm consent."
-    )
-    # Initializing user proxy 
-    user_proxy = autogen.UserProxyAgent(name="UserProxy", human_input_mode="NEVER")
-
-    # Starting groupchat between agents 
-    groupchat = autogen.GroupChat(agents=[planner, ethics, user_proxy], messages=[])
-
-    # Initializing groupchat manager
-    manager = autogen.GroupChatManager(groupchat=groupchat, llm_config={"config_list": config_list})
-    
-    # Initiating chat
-    manager.initiate_chat(user_proxy, message=f"Plan recon for IP {state['ip']}. Confirm authorization.")
-
-    state['messages'] = groupchat.messages
-    state['scan_results'] = {}
-
-    return state
-
-# Helper function for Scan node
-def run_nmap_command(container, command):
-    exec_result = container.exec_run(command)
-    output = exec_result.output.decode('utf-8')
-    return output
-
-# AutoGen NMAP scanning node
-def scan_node(state: ReconState) -> ReconState:
-    config_list = choose_llm(state)
+# Tools for Docker/Nmap operations
+@tool
+def run_nmap_scan(target_ip: str, scan_type: str = "basic") -> str:
+    """
+    Run nmap scan against target IP
+    Args:
+        target_ip: IP address to scan
+        scan_type: Type of scan
+    """
     client = docker.from_env()
-    container = client.containers.run('kalilinux/kali-rolling', detach=True, command='sleep infinity')
+    
+    # Define scan commands
+    scan_commands = {
+        "basic": f"nmap -sV {target_ip}",
+        "stealth": f"nmap -sS -O {target_ip}",
+        "aggressive": f"nmap -A {target_ip}",
+        "port_scan": f"nmap -p- {target_ip}",
+        "udp": f"nmap -sU {target_ip}",
+        "fast_scan": f"nmap -T4 -F {target_ip}",
+        "service_scan": f"nmap -sV -sC {target_ip}",
+        "top_ports": f"nmap --top-ports 20 {target_ip}",
+        "vuln_scan": f"nmap --script vuln {target_ip}"
+    }
+    
+    command = scan_commands.get(scan_type, scan_commands["basic"])
+    
     try:
-        # This agent decide on what type of scan should be excecuted 
-        scan_decider = autogen.AssistantAgent(
-            name="ScanDecider",
-            llm_config={"config_list": config_list},
-            system_message="Decide on appropriate scanning commands based on the plan and IP. Suggest nmap options like port ranges, scan types (e.g., -sV for version, -O for OS detection), or other tools if available. Ensure commands are ethical and targeted."
-        )
-        # This is an ethics agent
-        ethics = autogen.AssistantAgent(
-            name="EthicsChecker",
-            llm_config={"config_list": config_list},
-            system_message="Review and approve scan commands for ethical compliance."
-        )
-        user_proxy = autogen.UserProxyAgent(
-            name="UserProxy",
-            human_input_mode="NEVER",
-            code_execution_config=False,
-            default_auto_reply="",
-            is_termination_msg=lambda x: x.get("content", "").rstrip().endswith("TERMINATE")
-        )
-        # Define tool for executing in container
-        user_proxy.register_function(
-            function_map={
-                "run_nmap_command": lambda command: run_nmap_command(container, command)
-            }
-        )
-
-        groupchat = autogen.GroupChat(agents=[scan_decider, ethics, user_proxy], messages=[])
-        manager = autogen.GroupChatManager(groupchat=groupchat, llm_config={"config_list": config_list})
-        manager.initiate_chat(
-            user_proxy,
-            message=f"Decide and execute scan for IP {state['ip']}. Previous plan: {state['messages'][-1]['content'] if state['messages'] else 'No plan available.'}"
-        )
-        # Extract executed command output from chat history
-        executed_output = [msg['content'] for msg in groupchat.messages if 'tool_calls' in msg or 'function_call' in msg]  # Parse tool calls for output
-        state['scan_results']['nmap'] = executed_output[-1] if executed_output else "No scan output."
-        state['messages'].extend(groupchat.messages)
+        print(f"  [Docker] Running command: {command}")
+        output = client.containers.run('my-nmap:2.0', 
+                                        command=command).decode('utf-8')
+        
+        return f"Nmap scan completed:\n{output}"
+        
     except Exception as e:
-        state['scan_results'] = [f"Error: {str(e)}"]
-    finally:
-        container.remove(force=True)
-    return state
-
-# Helper function for Vulnarability assessment node 
-def run_metasploit_command(msf_client, module_type, module_name, options):
-    if module_type == 'auxiliary':
-        module = msf_client.modules.use('auxiliary', module_name)
-    elif module_type == 'exploit':
-        module = msf_client.modules.use('exploit', module_name)
-    else:
-        return "Invalid module type."
-    for key, value in options.items():
-        module[key] = value
-    result = module.execute()
-    return str(result)
-
-# AutoGen vulnarability assesment node
-def vuln_assessment_node(state: ReconState) -> ReconState:
-    # Creating container with port binding so that msfclient will be able to use it
-    client = docker.from_env()
-    container = client.containers.run('kali-metasploit', detach=True, ports={'55552/tcp': 55552})
-    try: 
-        time.sleep(5) # Wait for msfrpcd
-        msf_client = MsfRpcClient('password', host='localhost', port=55552)
-        config_list = choose_llm(state)
-
-        # This agent decide what auxiliary modules or scans should be used to assess vulnerabilities
-        vuln_decider = autogen.AssistantAgent(
-            name="VulnDecider",
-            llm_config={"config_list": config_list},
-            system_message="Based on scan results, decide on Metasploit auxiliary modules or scans to assess vulnerabilities. Suggest modules like scanner/http/http_version or db_nmap integration. Provide module type, name, and options dictionary."
-        )
-
-        # This is an ethics agent
-        ethics = autogen.AssistantAgent(
-            name="EthicsChecker",
-            llm_config={"config_list": config_list},
-            system_message="Review and approve vuln assessment commands for ethical compliance."
-        )
-
-        user_proxy = autogen.UserProxyAgent(
-            name="UserProxy",
-            human_input_mode="NEVER",
-            code_execution_config=False,
-            default_auto_reply="",
-            is_termination_msg=lambda x: x.get("content", "").rstrip().endswith("TERMINATE")
-        )
-        user_proxy.register_function(
-            function_map={
-                "run_metasploit_command": lambda module_type, module_name, options: run_metasploit_command(msf_client, module_type, module_name, options)
-            }
-        )
-        groupchat = autogen.GroupChat(agents=[vuln_decider, ethics, user_proxy], messages=[])
-        manager = autogen.GroupChatManager(groupchat=groupchat, llm_config={"config_list": config_list})
-        manager.initiate_chat(
-            user_proxy,
-            message=f"Assess vulnerabilities for IP {state['ip']}. Scan results: {state['scan_results']}. Previous plan: {state['messages'][-1]['content'] if state['messages'] else 'No plan.'}"
-        )
-        executed_output = [msg['content'] for msg in groupchat.messages if 'tool_calls' in msg or 'function_call' in msg]
-        state['vulns'] = executed_output if executed_output else ["No vulnerabilities assessed."]
-        state['messages'].extend(groupchat.messages)
+        return f"Nmap scan failed: {str(e)}"
     
+def run_metasploit_auxiliary(target_ip: str, module_name: str, options: Dict[str, str] = None) -> str:
+    """
+    Run Metasploit auxiliary module
+    Args:
+        target_ip: Target IP address
+        module_name: Metasploit auxiliary module name
+        options: Additional options for the module
+    """
+    client = docker.from_env()
+    container = None
+    
+    try:
+        container = client.containers.run('kali-metasploit', 
+                                        detach=True, 
+                                        ports={'55552/tcp': 55552})
+        time.sleep(5)  # Wait for msfrpcd to start
+        
+        msf_client = MsfRpcClient('password', host='localhost', port=55552)
+        module = msf_client.modules.use('auxiliary', module_name)
+        
+        # Set target
+        module['RHOSTS'] = target_ip
+        
+        # Set additional options
+        if options:
+            for key, value in options.items():
+                module[key] = value
+        
+        result = module.execute()
+        return f"Auxiliary scan completed: {str(result)}"
+        
     except Exception as e:
-        state['vulns'] = [f"Error: {str(e)}"]
+        return f"Metasploit auxiliary failed: {str(e)}"
     finally:
-        container.remove(force=True)
+        if container:
+            try:
+                container.remove(force=True)
+            except:
+                pass
+
+@tool
+def run_metasploit_exploit(target_ip: str, module_name: str, payload: str, options: Dict[str, str] = None) -> str:
+    """
+    Run Metasploit exploit module
+    Args:
+        target_ip: Target IP address
+        module_name: Metasploit exploit module name
+        payload: Payload to use
+        options: Additional options for the module
+    """
+    client = docker.from_env()
+    container = None
+    
+    try:
+        container = client.containers.run('kali-metasploit', 
+                                        detach=True, 
+                                        network_mode="host")
+        time.sleep(5)
+        
+        msf_client = MsfRpcClient('password', host='localhost', port=55552)
+        exploit = msf_client.modules.use('exploit', module_name)
+        
+        # Set target and payload
+        exploit['RHOSTS'] = target_ip
+        exploit['PAYLOAD'] = payload
+        
+        # Set additional options
+        if options:
+            for key, value in options.items():
+                exploit[key] = value
+        
+        result = exploit.execute()
+        
+        # Check if we got a session
+        sessions = msf_client.sessions.list
+        if sessions:
+            return f"Exploit successful! Sessions: {sessions}"
+        else:
+            return f"Exploit executed but no sessions created: {str(result)}"
+        
+    except Exception as e:
+        return f"Metasploit exploit failed: {str(e)}"
+    finally:
+        if container:
+            try:
+                container.remove(force=True)
+            except:
+                pass
+
+# Create tool node
+tools = [run_nmap_scan, run_metasploit_auxiliary, run_metasploit_exploit]
+tool_node = ToolNode(tools)
+
+# Planning Node
+def planning_node(state: ReconState) -> ReconState:
+    """Generate reconnaissance plan using LLM"""
+
+    print("Entering planning_node")
+    state['current_step'] = 'planning'
+    
+    llm = get_llm(state['llm_provider'], state['api_key'], state['local_model'])
+    
+    system_prompt = """You are a cybersecurity expert creating a reconnaissance plan.
+    Generate a comprehensive but concise reconnaissance plan for the target IP.
+    
+    Include these phases:
+    1. Initial reconnaissance (whois, DNS)
+    2. Port scanning strategy
+    3. Service enumeration
+    4. Vulnerability assessment approach
+    5. Potential exploitation vectors
+    
+    Be specific about tools and techniques.
+    End your response with 'PLAN_COMPLETE'"""
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "Create a reconnaissance plan for IP: {ip}\nUser requirements: {user_input}")
+    ])
+    
+    try:
+        #prompt formats the messages using variables (like {ip}, {user_input}),then the result is sent into the LLM.
+        chain = prompt | llm
+        response = chain.invoke({
+            "ip": state['ip'],
+            "user_input": state['user_input']
+        })
+        
+        state['messages'].append(AIMessage(content=response.content))
+        state['plan']=response.content
+        print("Planning completed successfully")
+        
+    except Exception as e:
+        error_msg = f"Planning failed: {str(e)}"
+        print(error_msg)
+        state['errors'].append(error_msg)
+        state['messages'].append(AIMessage(content=error_msg))
+    
     return state
 
-# AutoGen exploitation node
+def parse_scan_results(scan_output: str) -> Dict[str, List[str]]:
+    """Parse nmap scan output to extract discovered services"""
+    services = {}
+    lines = scan_output.split('\n')
+    
+    for line in lines:
+        # Look for open ports (format: PORT/tcp open service)
+        if '/tcp' in line and 'open' in line:
+            parts = line.split()
+            if len(parts) >= 3:
+                port = parts[0].split('/')[0]
+                service = parts[2] if len(parts) > 2 else 'unknown'
+                if port not in services:
+                    services[port] = []
+                services[port].append(service)
+        elif '/udp' in line and 'open' in line:
+            parts = line.split()
+            if len(parts) >= 3:
+                port = parts[0].split('/')[0]
+                service = parts[2] if len(parts) > 2 else 'unknown'
+                if port not in services:
+                    services[port] = []
+                services[port].append(service)
+    
+    return services
+
+def determine_next_scan_type(state: ReconState, plan_content: str) -> tuple:
+    """Determine the next scan type based on current state and plan"""
+    scan_progression = state.get('scan_progression', [])
+    discovered_services = state.get('discovered_services', {})
+    scan_results = state.get('scan_results', {})
+    
+    # If no scans done yet, starts with fast discovery
+    if not scan_progression:
+        return "fast_scan", None
+    
+    # If fast scan done but no service scan, do detailed service enumeration
+    if "fast_scan" in scan_progression and "service_scan" not in scan_progression:
+        if discovered_services:
+            ports = ",".join(discovered_services.keys())
+            return "service_scan", ports
+        else:
+            return "top_ports", None
+    
+    # If services but no vulnerability scan
+    if discovered_services and "vuln_scan" not in scan_progression:
+        return "vuln_scan", None
+    
+    # If plan mentions UDP and we haven't done UDP scan
+    if "udp" not in scan_progression and ("udp" in plan_content.lower() or "snmp" in plan_content.lower()):
+        return "udp", None
+    
+    # If limited services found, try comprehensive port scan
+    if len(discovered_services) < 3 and "port_scan" not in scan_progression:
+        return "port_scan", None
+    
+    # If we have services but no OS detection
+    if discovered_services and "aggressive" not in scan_progression:
+        return "aggressive", None
+    
+    # No more scans needed
+    return None, None
+
+def scan_node(state: ReconState) -> ReconState:
+    """Execute network scanning using tools with progressive scan logic"""
+    print("Entering scan_node")
+    state['current_step'] = 'scanning'
+    
+    # Initialize scan tracking fields if not present
+    if 'scan_progression' not in state:
+        state['scan_progression'] = []
+    if 'discovered_services' not in state:
+        state['discovered_services'] = {}
+    if 'max_scan_iterations' not in state:
+        state['max_scan_iterations'] = 4
+    
+    # Checking for the plan
+    plan_content = ""
+    for msg in reversed(state['messages']):
+        if isinstance(msg, AIMessage) and 'PLAN_COMPLETE' in msg.content:
+            plan_content = msg.content
+            break
+    
+    next_scan_type, target_ports = determine_next_scan_type(state, plan_content)
+    
+    if not next_scan_type:
+        print("No additional scans needed based on current results")
+        return state
+    
+    print(f"Executing {next_scan_type} scan (iteration {len(state['scan_progression']) + 1})")
+    
+    llm = get_llm(state['llm_provider'], state['api_key'], state['local_model'])
+    llm_with_tools = llm.bind_tools(tools)
+    
+    # CORRECTED PROMPT: This is now a template, not an f-string
+    system_prompt = """You are a network scanning specialist executing a progressive scanning strategy.
+
+    CURRENT SCAN PROGRESSION: {progression}
+    DISCOVERED SERVICES SO FAR: {services}
+    NEXT RECOMMENDED SCAN: {scan_type}
+    TARGET PORTS: {ports}
+    
+    Based on the progressive scanning strategy, you **MUST** execute the {scan_type} scan.
+    
+    Call the `run_nmap_scan` tool with the `scan_type` parameter set to '{scan_type}'.
+    
+    Do not ask for permission. Execute the scan immediately."""
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "Execute the next scan for IP: {ip} based on the plan: {plan}"),
+        MessagesPlaceholder(variable_name="messages")
+    ])
+    
+    try:
+        chain = prompt | llm_with_tools
+        # CORRECTED INVOKE: Pass all variables for the template here
+        response = chain.invoke({
+            "ip": state['ip'],
+            "plan": plan_content,
+            "progression": state['scan_progression'],
+            "services": state['discovered_services'],
+            "scan_type": next_scan_type,
+            "ports": target_ports if target_ports else 'All relevant ports',
+            "messages": []
+        })
+        
+        state['messages'].append(response)
+        
+        if response.tool_calls:
+            tool_results = tool_node.invoke({"messages": [response]})
+            state['messages'].extend(tool_results['messages'])
+            
+            scan_executed = False
+            for msg in tool_results['messages']:
+                if hasattr(msg, 'content') and 'scan completed' in msg.content:
+                    scan_key = f"nmap_{next_scan_type}"
+                    state['scan_results'][scan_key] = msg.content
+                    
+                    new_services = parse_scan_results(msg.content)
+                    if new_services:
+                        state['discovered_services'].update(new_services)
+                        print(f"New services discovered: {new_services}")
+                    
+                    if next_scan_type not in state['scan_progression']:
+                        state['scan_progression'].append(next_scan_type)
+                    
+                    scan_executed = True
+                    print(f"Successfully executed {next_scan_type} scan. Total services: {len(state['discovered_services'])}")
+                    break
+            
+            if not scan_executed:
+                print(f"Tool calls made but no scan completion detected for {next_scan_type}")
+                
+        else:
+            print(f"No tool calls made for {next_scan_type} scan")
+            state['scan_results'][f'nmap_{next_scan_type}'] = f"No {next_scan_type} scan executed"
+            
+    except Exception as e:
+        error_msg = f"{next_scan_type} scanning failed: {str(e)}"
+        print(error_msg)
+        state['errors'].append(error_msg)
+        state['scan_results'][f'nmap_{next_scan_type}'] = error_msg
+    
+    print(f"Scan node complete. Progression: {state['scan_progression']}, Services: {len(state['discovered_services'])}")
+    return state
+
+# Helper function that is used in a conditional edge 
+def should_continue_scanning(state: ReconState) -> str:
+    """
+    Decide whether to continue scanning or move to vulnerability assessment
+    Returns: 'scan' to continue scanning, 'vuln_assessment' to move forward
+    """
+    print(f"Evaluating scan continuation...")
+    print(f"  Current progression: {state.get('scan_progression', [])}")
+    print(f"  Discovered services: {len(state.get('discovered_services', {}))}")
+    print(f"  Max iterations: {state.get('max_scan_iterations', 4)}")
+    
+    # Check iteration limit
+    max_iterations = state.get('max_scan_iterations', 4)
+    current_iterations = len(state.get('scan_progression', []))
+    
+    if current_iterations >= max_iterations:
+        print(f"  → Max iterations reached ({current_iterations}/{max_iterations}), moving to vulnerability assessment")
+        return "vuln_assessment"
+    
+    # Get plan content for context
+    plan_content = ""
+    for msg in reversed(state.get('messages', [])):
+        if isinstance(msg, AIMessage) and 'PLAN_COMPLETE' in msg.content:
+            plan_content = msg.content.lower()
+            break
+    
+    # Determine if there's a logical next scan
+    next_scan_type, _ = determine_next_scan_type(state, plan_content)
+    
+    if next_scan_type:
+        print(f"  → Continue scanning with {next_scan_type}")
+        return "scan"
+    else:
+        print(f"  → No more scans needed, moving to vulnerability assessment")
+        return "vuln_assessment"
+
+
+# Vulnerability Assessment Node
+def vuln_assessment_node(state: ReconState) -> ReconState:
+    """Assess vulnerabilities using Metasploit auxiliary modules"""
+    print("Entering vuln_assessment_node")
+    state['current_step'] = 'vulnerability_assessment'
+    
+    llm = get_llm(state['llm_provider'], state['api_key'], state['local_model'])
+    llm_with_tools = llm.bind_tools(tools)
+    
+    system_prompt = """You are a vulnerability assessment specialist.
+    Your task is to verify potential vulnerabilities based on the overall mission plan and the technical scan results.
+    
+    **Mission Plan:** {plan}
+    
+    Based on the plan's objectives and the open ports found, you MUST call the `run_metasploit_auxiliary` tool to investigate the most relevant services."""
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "Assess vulnerabilities for IP: {ip}\nScan results: {scan_results}"),
+        MessagesPlaceholder(variable_name="messages")
+    ])
+    
+    try:
+        chain = prompt | llm_with_tools
+        response = chain.invoke({
+            "plan": state['plan'],
+            "ip": state['ip'],
+            "scan_results": state['scan_results'],
+            "messages": []
+        })
+        
+        state['messages'].append(response)
+        
+        # Execute tool calls if any
+        if response.tool_calls:
+            tool_results = tool_node.invoke({"messages": [response]})
+            state['messages'].extend(tool_results['messages'])
+            
+            # Extract vulnerability information
+            vulns = []
+            for msg in tool_results['messages']:
+                if hasattr(msg, 'content') and 'Auxiliary scan completed' in msg.content:
+                    vulns.append(msg.content)
+            
+            state['vulns'] = vulns if vulns else ["No vulnerabilities assessed"]
+        else:
+            state['vulns'] = ["No vulnerability assessment performed"]
+            
+    except Exception as e:
+        error_msg = f"Vulnerability assessment failed: {str(e)}"
+        print(error_msg)
+        state['errors'].append(error_msg)
+        state['vulns'] = [error_msg]
+    
+    return state
+
+# Exploitation Node
 def exploitation_node(state: ReconState) -> ReconState:
+    """Attempt exploitation based on discovered vulnerabilities"""
+    print("Entering exploitation_node")
+    state['current_step'] = 'exploitation'
     state['exploitation_attempt'] = True
     state['shell_success'] = False
-    if state['vulns']:
-        client = docker.from_env()
-        container = client.containers.run('kali-metasploit', detach=True, ports={'55552/tcp': 55552}, network_mode="host")
-        try:
-            time.sleep(5)
-            msf_client = MsfRpcClient('password', host='localhost', port=55552)
-            config_list = choose_llm(state)
-
-            # This agent decide on Metasploit exploit based on vulnarabilities that were found
-            exploit_decider = autogen.AssistantAgent(
-                name="ExploitDecider",
-                llm_config={"config_list": config_list},
-                system_message="Based on vulnerabilities, decide on Metasploit exploit modules and payloads. Suggest safe, simulated exploits if possible. Provide module type ('exploit'), name, options dict, and payload."
-            )
-
-            # This is an ethics agent
-            ethics = autogen.AssistantAgent(
-                name="EthicsChecker",
-                llm_config={"config_list": config_list},
-                system_message="Strictly review and approve exploitation attempts for ethical and legal compliance. Block if not authorized."
-            )
-            user_proxy = autogen.UserProxyAgent(
-                name="UserProxy",
-                human_input_mode="NEVER",
-                code_execution_config=False,
-                default_auto_reply="",
-                is_termination_msg=lambda x: x.get("content", "").rstrip().endswith("TERMINATE")
-            )
-            user_proxy.register_function(
-                function_map={
-                    "run_metasploit_command": lambda module_type, module_name, options: run_metasploit_command(msf_client, module_type, module_name, options)
-                }
-            )
-            groupchat = autogen.GroupChat(agents=[exploit_decider, ethics, user_proxy], messages=[])
-            manager = autogen.GroupChatManager(groupchat=groupchat, llm_config={"config_list": config_list})
-            manager.initiate_chat(
-                user_proxy,
-                message=f"Decide and attempt exploitation for IP {state['ip']}. Vulns: {state['vulns']}. Ensure ethical approval."
-            )
-            executed_output = [msg['content'] for msg in groupchat.messages if 'tool_calls' in msg or 'function_call' in msg]
-            state['shell_success'] = "job_id" in executed_output[-1] if executed_output else False  # Simplified check
-            state['scan_results']['exploit'] = executed_output if executed_output else "No exploitation output."
-            state['messages'].extend(groupchat.messages)
-        except Exception as e:
-            state['scan_results']['exploit'] = f"Exploit failed: {str(e)}"
-        finally:
-            container.remove(force=True)
+    
+    if not state['vulns']:
+        state['scan_results']['exploit'] = "No vulnerabilities to exploit"
+        return state
+    
+    llm = get_llm(state['llm_provider'], state['api_key'], state['local_model'])
+    llm_with_tools = llm.bind_tools(tools)
+    
+    system_prompt = """You are a penetration testing specialist.
+    Your goal is to attempt exploitation according to the mission plan.
+    
+    **Mission Plan:** {plan}
+    
+    Review the plan and the discovered vulnerabilities. If the plan allows for it, you MUST call the `run_metasploit_exploit` tool to attempt an exploitation."""
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "Attempt exploitation for IP: {ip}\nVulnerabilities: {vulns}\n!"),
+        MessagesPlaceholder(variable_name="messages")
+    ])
+    
+    try:
+        chain = prompt | llm_with_tools
+        response = chain.invoke({
+            "plan": state["plan"],
+            "ip": state['ip'],
+            "vulns": state['vulns'],
+            "messages": []
+        })
+        
+        state['messages'].append(response)
+        
+        # Execute tool calls if any
+        if response.tool_calls:
+            tool_results = tool_node.invoke({"messages": [response]})
+            state['messages'].extend(tool_results['messages'])
+            
+            # Check for successful exploitation
+            for msg in tool_results['messages']:
+                if hasattr(msg, 'content'):
+                    state['scan_results']['exploit'] = msg.content
+                    if 'Exploit successful' in msg.content or 'Sessions:' in msg.content:
+                        state['shell_success'] = True
+        else:
+            state['scan_results']['exploit'] = "No exploitation attempted"
+            
+    except Exception as e:
+        error_msg = f"Exploitation failed: {str(e)}"
+        print(error_msg)
+        state['errors'].append(error_msg)
+        state['scan_results']['exploit'] = error_msg
+    
     return state
 
-# AutoGen analysis node
+# Analysis and Reporting Node
 def analysis_node(state: ReconState) -> ReconState:
-    config_list = choose_llm(state)
-
-    # Initializing Analyst agent 
-    analyst = autogen.AssistantAgent(
-        name="Analyst",
-        llm_config={"config_list": config_list},
-        system_message="Analyze scan results and vulnerabilities."
-    )
-
-    # Initializing Reporter agent 
-    reporter = autogen.AssistantAgent(
-        name="Reporter",
-        llm_config={"config_list": config_list},
-        system_message="Generate a detailed report summarizing findings."
-    )
-
-    user_proxy = autogen.UserProxyAgent(name="UserProxy", human_input_mode="NEVER")
-    groupchat = autogen.GroupChat(agents=[analyst, reporter, user_proxy], messages=[])
-    manager = autogen.GroupChatManager(groupchat=groupchat, llm_config={"config_list": config_list})
-    manager.initiate_chat(user_proxy, message=f"Analyze: {state['scan_results']} and vulns: {state['vulns']}. Generate report.")
-    state['messages'].extend(groupchat.messages)
-    state['report'] = groupchat.messages[-1]['content'] if groupchat.messages else "No analysis available."
+    """Generate comprehensive analysis and report"""
+    print("Entering analysis_node")
+    state['current_step'] = 'analysis'
+    
+    llm = get_llm(state['llm_provider'], state['api_key'], state['local_model'])
+    
+    system_prompt = """You are a cybersecurity analyst creating a comprehensive penetration testing report.
+    
+    Generate a detailed report that includes:
+    1. Executive Summary
+    2. Scope and Methodology  
+    3. Reconnaissance Findings
+    4. Vulnerability Assessment Results
+    5. Exploitation Attempts and Results
+    6. Risk Assessment
+    7. Recommendations
+    8. Technical Details
+    
+    Make the report professional, thorough, and actionable.
+    Include severity ratings for vulnerabilities (Critical, High, Medium, Low).
+    """
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", """Generate penetration testing report:
+        
+        Target: {ip}
+        Scan Results: {scan_results}
+        Vulnerabilities: {vulns}
+        Exploitation Attempted: {exploitation_attempt}
+        Shell Success: {shell_success}
+        Errors Encountered: {errors}
+        """)
+    ])
+    
+    try:
+        chain = prompt | llm
+        response = chain.invoke({
+            "ip": state['ip'],
+            "scan_results": state['scan_results'],
+            "vulns": state['vulns'],
+            "exploitation_attempt": state['exploitation_attempt'],
+            "shell_success": state['shell_success'],
+            "errors": state.get('errors', [])
+        })
+        
+        state['report'] = response.content
+        state['messages'].append(response)
+        
+    except Exception as e:
+        error_msg = f"Analysis failed: {str(e)}"
+        print(error_msg)
+        state['errors'].append(error_msg)
+        state['report'] = f"Report generation failed: {str(e)}"
+    
     return state
 
-workflow = StateGraph(ReconState)
+# Create the workflow
+def create_recon_workflow():
+    """Create workflow with conditional scanning logic and recursion limit"""
+    workflow = StateGraph(ReconState)
+    
+    # Add all nodes
+    workflow.add_node("planning", planning_node)
+    workflow.add_node("scan", scan_node) 
+    workflow.add_node("vuln_assessment", vuln_assessment_node)
+    workflow.add_node("exploitation", exploitation_node)
+    workflow.add_node("analysis", analysis_node)
+    workflow.add_node("tools", tool_node)
+    
+    # Define the flow with conditional scanning
+    workflow.set_entry_point("planning")
+    workflow.add_edge("planning", "scan")
+    
+    # CONDITIONAL EDGE: Key change for Method 1
+    workflow.add_conditional_edges(
+        "scan",
+        should_continue_scanning,  # Decision function
+        {
+            "scan": "scan",                    # Loop back for more scanning
+            "vuln_assessment": "vuln_assessment"  # Move to vulnerability assessment
+        }
+    )
+    
+    workflow.add_edge("vuln_assessment", "exploitation")
+    workflow.add_edge("exploitation", "analysis")
+    workflow.add_edge("analysis", END)
+    
+    return workflow.compile()
 
-# Adding nodes
-workflow.add_node("planning", planning_node)
-workflow.add_node("scan", scan_node)
-workflow.add_node("vuln_assessment", vuln_assessment_node)
-workflow.add_node("exploitation", exploitation_node)
-workflow.add_node("analysis", analysis_node)
 
-#Settign entry point and defining edges 
-workflow.set_entry_point("planning")
-workflow.add_edge("planning", "scan")
-workflow.add_edge("scan", "vuln_assessment")
-workflow.add_edge("vuln_assessment", "exploitation")
-workflow.add_edge("exploitation", "analysis")
-workflow.add_edge("analysis", END)
+# Usage example and state initialization helper
+def initialize_recon_state(ip: str, user_input: str, llm_provider: str, 
+                          api_key: str, local_model: str = None) -> ReconState:
+    """Initialize a ReconState with default values"""
+    return ReconState(
+        ip=ip,
+        user_input=user_input,
+        scan_results={},
+        vulns=[],
+        exploitation_attempt=False,
+        shell_success=False,
+        report="",
+        llm_provider=llm_provider,
+        api_key=api_key,
+        local_model=local_model or "",
+        messages=[],
+        current_step="",
+        errors=[],
+        # Progressive scanning fields
+        scan_progression=[],
+        discovered_services={},
+        max_scan_iterations=4
+    )
 
-app = workflow.compile()
+# Main execution function
+def run_reconnaissance(ip: str, user_input: str, llm_provider: str, 
+                      api_key: str, local_model: str = None) -> ReconState:
+    """Run the complete reconnaissance workflow"""
+    
+    # Create workflow
+    app = create_recon_workflow()
+    
+    # Initialize state
+    initial_state = initialize_recon_state(ip, user_input, llm_provider, api_key, local_model)
+    
+    # Execute workflow
+    final_state = app.invoke(initial_state)
+    
+    return final_state
+

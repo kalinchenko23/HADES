@@ -54,7 +54,7 @@ func (c *LLMConfig) Validate() []ValidationError {
 
 	// Validate provider for validity
 	} else {
-		validProviders := []string{"ollama", "openai", "anthropic", "azure", "grok"}
+		validProviders := []string{"ollama", "openai", "anthropic", "gemini", "grok"}
 		if !llmpPoviderContains(validProviders, c.Provider) {
 			errors = append(errors, ValidationError{
 				Field:   "provider",
