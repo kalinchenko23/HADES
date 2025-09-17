@@ -90,7 +90,8 @@ def run_nmap_scan(target_ip: str, scan_type: str = "basic") -> str:
     try:
         print(f"  [Docker] Running command: {command}")
         output = client.containers.run('my-nmap:2.0', 
-                                        command=command).decode('utf-8')
+                                        command=command,
+                                        remove=True).decode('utf-8')
         
         return f"Nmap scan completed:\n{output}"
         
@@ -106,13 +107,12 @@ def run_metasploit_auxiliary(target_ip: str, module_name: str, options: Dict[str
         options: Additional options for the module
     """
     client = docker.from_env()
-    container = None
-    
+
     try:
-        container = client.containers.run('kali-metasploit', 
-                                        detach=True, 
+        container = client.containers.run('kali-metasploit:latest', 
+                                        remove=True,
                                         ports={'55552/tcp': 55552})
-        time.sleep(5)  # Wait for msfrpcd to start
+        time.sleep(15)  # Wait for msfrpcd to start
         
         msf_client = MsfRpcClient('password', host='localhost', port=55552)
         module = msf_client.modules.use('auxiliary', module_name)
@@ -130,13 +130,7 @@ def run_metasploit_auxiliary(target_ip: str, module_name: str, options: Dict[str
         
     except Exception as e:
         return f"Metasploit auxiliary failed: {str(e)}"
-    finally:
-        if container:
-            try:
-                container.remove(force=True)
-            except:
-                pass
-
+   
 @tool
 def run_metasploit_exploit(target_ip: str, module_name: str, payload: str, options: Dict[str, str] = None) -> str:
     """
@@ -148,13 +142,12 @@ def run_metasploit_exploit(target_ip: str, module_name: str, payload: str, optio
         options: Additional options for the module
     """
     client = docker.from_env()
-    container = None
     
     try:
-        container = client.containers.run('kali-metasploit', 
-                                        detach=True, 
+        container = client.containers.run('kali-metasploit',                        
+                                        remove=True,
                                         network_mode="host")
-        time.sleep(5)
+        time.sleep(15)
         
         msf_client = MsfRpcClient('password', host='localhost', port=55552)
         exploit = msf_client.modules.use('exploit', module_name)
@@ -179,12 +172,6 @@ def run_metasploit_exploit(target_ip: str, module_name: str, payload: str, optio
         
     except Exception as e:
         return f"Metasploit exploit failed: {str(e)}"
-    finally:
-        if container:
-            try:
-                container.remove(force=True)
-            except:
-                pass
 
 # Create tool node
 tools = [run_nmap_scan, run_metasploit_auxiliary, run_metasploit_exploit]
@@ -473,10 +460,11 @@ def vuln_assessment_node(state: ReconState) -> ReconState:
         })
         
         state['messages'].append(response)
-        
+        print(response)
         # Execute tool calls if any
         if response.tool_calls:
             tool_results = tool_node.invoke({"messages": [response]})
+            
             state['messages'].extend(tool_results['messages'])
             
             # Extract vulnerability information
@@ -533,7 +521,7 @@ def exploitation_node(state: ReconState) -> ReconState:
             "vulns": state['vulns'],
             "messages": []
         })
-        
+        print(response)
         state['messages'].append(response)
         
         # Execute tool calls if any

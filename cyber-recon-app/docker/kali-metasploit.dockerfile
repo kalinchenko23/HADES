@@ -1,32 +1,33 @@
-# Build a Kali image with Metasploit and msfrpcd available.
-FROM kalilinux/kali-rolling:latest
+# Dockerfile for a Kali-based image with Metasploit + msfrpcd
+FROM kalilinux/kali-rolling
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV MSF_RPC_PASS=password
 ENV MSF_RPC_PORT=55552
 
-RUN echo "deb http://http.kali.org/kali kali-last-snapshot main contrib non-free non-free-firmware" > /etc/apt/sources.list
+# Keep layers compact, install metasploit and lightweight tools
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      metasploit-framework \
+      postgresql \
+      python3 \
+      python3-pip \
+      ca-certificates \
+      net-tools \
+      iproute2 \
+      procps \
+      curl \
+      less \
+      vim && \
+    pip3 install --no-cache-dir msfrpc pymetasploit3 || true && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/*
 
-# install packages (metasploit, supervisor, postgresql, msfrpcd is part of metasploit)
-RUN apt-get clean && rm -rf /var/lib/apt/lists/* \
- && apt-get update -o Acquire::CompressionTypes::Order::=gz \
- && apt-get -o Acquire::http::No-Cache=True -o Acquire::BrokenProxy=true install -y --no-install-recommends \
-    metasploit-framework \
-    postgresql \
-    supervisor \
-    curl \
-    ca-certificates \
-    python3 \
-    python3-pip \
- && rm -rf /var/lib/apt/lists/*
-# Ensure msfdb utility available and init DB
-RUN msfdb init || true
+# copy entrypoint
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# Supervisor config directory
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+EXPOSE 55552/tcp
 
-EXPOSE 55552
+# default environment password (override with -e MSF_PASSWORD=...)
+ENV MSF_PASSWORD=password
 
-CMD ["/usr/local/bin/entrypoint.sh"]
+CMD ["/entrypoint.sh"]
