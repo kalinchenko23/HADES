@@ -1,14 +1,16 @@
-# Dockerfile for a Kali-based image with Metasploit + msfrpcd
+# Dockerfile
 FROM kalilinux/kali-rolling
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MSF_RPC_PORT=55552
+ENV MSF_PASSWORD=password
+ENV PGDATA=/var/lib/postgresql/data
 
-# Keep layers compact, install metasploit and lightweight tools
+# Install required packages (metasploit + postgres + useful tools)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      metasploit-framework \
       postgresql \
+      postgresql-contrib \
       python3 \
       python3-pip \
       ca-certificates \
@@ -17,17 +19,25 @@ RUN apt-get update && \
       procps \
       curl \
       less \
-      vim && \
+      vim \
+      sudo \
+      wget \
+      findutils \
+      gnupg2 && \
+    apt-get install -y metasploit-framework || true && \
     pip3 install --no-cache-dir msfrpc pymetasploit3 || true && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/*
+
+# Ensure msf bin dir is on PATH (Metasploit often installs under /usr/share/.../bin)
+ENV PATH="/usr/share/metasploit-framework/bin:${PATH}"
+
+# Ensure PGDATA exists
+RUN mkdir -p ${PGDATA} && chown -R 999:999 ${PGDATA} || true
 
 # copy entrypoint
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 55552/tcp
-
-# default environment password (override with -e MSF_PASSWORD=...)
-ENV MSF_PASSWORD=password
+EXPOSE ${MSF_RPC_PORT}/tcp
 
 CMD ["/entrypoint.sh"]

@@ -109,7 +109,8 @@ def run_metasploit_auxiliary(target_ip: str, module_name: str, options: Dict[str
     client = docker.from_env()
 
     try:
-        container = client.containers.run('kali-metasploit:latest', 
+        container = client.containers.run('kali-metasploit:latest',
+                                        detach=True, 
                                         remove=True,
                                         ports={'55552/tcp': 55552})
         time.sleep(15)  # Wait for msfrpcd to start
@@ -144,7 +145,8 @@ def run_metasploit_exploit(target_ip: str, module_name: str, payload: str, optio
     client = docker.from_env()
     
     try:
-        container = client.containers.run('kali-metasploit',                        
+        container = client.containers.run('kali-metasploit',
+                                        detach=True,                        
                                         remove=True,
                                         network_mode="host")
         time.sleep(15)
@@ -214,6 +216,8 @@ def planning_node(state: ReconState) -> ReconState:
         
         state['messages'].append(AIMessage(content=response.content))
         state['plan']=response.content
+        ###THIS IS A SHORTCUT DUMMY OUTPUT REMOVE FOR PRODUCTION###
+        state['scan_results']['Agressive scan'] = 'This is a Nmap scan output, which is a network scanning tool used to discover hosts, services, and operating systems on a network.\n\nHere are the key findings:\n\n**Open ports**\n\n* 21/tcp: FTP service running (vsftpd 2.3.4)\n* 22/tcp: SSH service running (OpenSSH 4.7p1 Debian 8ubuntu1)\n* 23/tcp: Telnet service running (Linux telnetd)\n* 25/tcp: SMTP service running (Postfix smtpd)\n* 53/tcp: DNS service running (ISC BIND 9.4.2)\n* 80/tcp: HTTP service running (Apache httpd 2.2.8)\n* 111/tcp: RPC service running\n* 139/tcp: NetBIOS service running (Samba smbd 3.X - 4.X)\n* 445/tcp: NetBIOS service running (Samba smbd 3.X - 4.X)\n* 512/tcp: Exec service running (netkit-rsh rexecd)\n* 513/tcp: Login service running (OpenBSD or Solaris rlogind)\n* 514/tcp: TCP-wrapped service\n* 1099/tcp: Java RMI service running\n* 1524/tcp: Bindshell service running (Metasploitable root shell)\n* 2049/tcp: NFS service running\n* 2121/tcp: FTP service running (ProFTPD 1.3.1)\n* 3128/tcp: Squid HTTP proxy service\n* 3306/tcp: MySQL database service running (MySQL 5.0.51a-3ubuntu5)\n* 5432/tcp: PostgreSQL database service running (PostgreSQL DB 8.3.0 - 8.3.7)\n* 5900/tcp: VNC service running\n\n**Operating System**\n\nThe operating system is likely a Linux distribution, possibly Ubuntu or Debian.\n\n**Vulnerabilities**\n\nThere are several potential vulnerabilities identified:\n\n* The FTP server allows anonymous login.\n* The SSH server uses an outdated version of OpenSSH (4.7p1).\n* The DNS server runs on an outdated version of BIND (9.4.2).\n* The HTTP server runs on an outdated version of Apache (2.2.8).\n\n**Other findings**\n\nThe Nmap scan also identified several other services running on the target host, including:\n\n* A Java RMI service\n* A bindshell service\n* An NFS service\n* A VNC service\n\nOverall, this report suggests that the target host has several potential vulnerabilities and outdated software installations.'
         print("Planning completed successfully")
         
     except Exception as e:
@@ -620,17 +624,17 @@ def create_recon_workflow():
     
     # Define the flow with conditional scanning
     workflow.set_entry_point("planning")
-    workflow.add_edge("planning", "scan")
-    
+    # workflow.add_edge("planning", "scan")
+    workflow.add_edge("planning", "vuln_assessment")
     # CONDITIONAL EDGE: Key change for Method 1
-    workflow.add_conditional_edges(
-        "scan",
-        should_continue_scanning,  # Decision function
-        {
-            "scan": "scan",                    # Loop back for more scanning
-            "vuln_assessment": "vuln_assessment"  # Move to vulnerability assessment
-        }
-    )
+    # workflow.add_conditional_edges(
+    #     "scan",
+    #     should_continue_scanning,  # Decision function
+    #     {
+    #         "scan": "scan",                    # Loop back for more scanning
+    #         "vuln_assessment": "vuln_assessment"  # Move to vulnerability assessment
+    #     }
+    # )
     
     workflow.add_edge("vuln_assessment", "exploitation")
     workflow.add_edge("exploitation", "analysis")
