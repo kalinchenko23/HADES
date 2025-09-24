@@ -9,9 +9,11 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from typing import Any
 import docker
 import time
 import json
+import socket
 from pymetasploit3.msfrpc import MsfRpcClient
 
 # Enhanced State class with better typing
@@ -98,39 +100,103 @@ def run_nmap_scan(target_ip: str, scan_type: str = "basic") -> str:
     except Exception as e:
         return f"Nmap scan failed: {str(e)}"
     
-def run_metasploit_auxiliary(target_ip: str, module_name: str, options: Dict[str, str] = None) -> str:
-    """
-    Run Metasploit auxiliary module
-    Args:
-        target_ip: Target IP address
-        module_name: Metasploit auxiliary module name
-        options: Additional options for the module
-    """
-    client = docker.from_env()
+def wait_for_port(host: str, port: int, timeout: int = 30, interval: float = 0.5) -> bool:
+    """Wait until a TCP port is connectable."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except (OSError, ConnectionRefusedError):
+            time.sleep(interval)
+    return False
 
+# You can start your container manually:
+# docker run -d --name kali-metasploit -e MSF_PASSWORD=password -p 55552:55552 kali-metasploit
+
+PREFERRED_SYNC_MODULES = {
+    '21': 'auxiliary/scanner/ftp/ftp_login',  # Returns immediate auth results
+    '22': 'auxiliary/scanner/ssh/ssh_login',  # Returns immediate auth results  
+    '23': 'auxiliary/scanner/telnet/telnet_login',  # Returns immediate results
+    '25': 'auxiliary/scanner/smtp/smtp_enum',  # Returns immediate enum results
+    '80': 'auxiliary/scanner/http/http_version',  # Returns immediate version
+    '139': 'auxiliary/scanner/smb/smb_login',  # Returns immediate auth results
+    '445': 'auxiliary/scanner/smb/smb_version',  # Returns immediate version
+    '3306': 'auxiliary/scanner/mysql/mysql_login',  # Returns immediate auth results
+    '5432': 'auxiliary/scanner/postgres/postgres_login'  # Returns immediate auth results
+}
+
+@tool
+def run_metasploit_auxiliary(target_ip: str, module_name: str, options: Dict[str, Any] = None) -> str:
+    """
+    Run Metasploit auxiliary module using console interface to capture output
+    """
     try:
-        container = client.containers.run('kali-metasploit:latest',
-                                        detach=True, 
-                                        remove=True,
-                                        ports={'55552/tcp': 55552})
-        time.sleep(15)  # Wait for msfrpcd to start
+        msf_client = MsfRpcClient(
+            password='my-super-secret-password',
+            user='msf', 
+            server='192.168.34.131',
+            port=55553, 
+            ssl=True
+        )
         
-        msf_client = MsfRpcClient('password', host='localhost', port=55552)
-        module = msf_client.modules.use('auxiliary', module_name)
+        if not msf_client.authenticated:
+            return "Failed to authenticate with Metasploit RPC"
         
-        # Set target
-        module['RHOSTS'] = target_ip
+        # Create a console
+        console = msf_client.consoles.console()
+        console_id = console.cid
         
-        # Set additional options
-        if options:
+        # Build the command string
+        commands = [
+            f"use auxiliary/{module_name}",
+            f"set RHOSTS {target_ip}"
+        ]
+        
+        # Add options if provided
+        if options and isinstance(options, dict):
             for key, value in options.items():
-                module[key] = value
+                commands.append(f"set {key} {value}")
         
-        result = module.execute()
-        return f"Auxiliary scan completed: {str(result)}"
+        # Add run command
+        commands.append("run")
+        
+        # Execute commands
+        full_output = []
+        
+        for cmd in commands:
+            console.write(cmd)
+            # Wait a bit for command to process
+            import time
+            time.sleep(1)
+            
+            # Read output
+            output = console.read()
+            if output['data']:
+                full_output.append(f"Command: {cmd}")
+                full_output.append(output['data'])
+        
+        # Wait for module to complete
+        time.sleep(5)
+        
+        # Get final output
+        final_output = console.read()
+        if final_output['data']:
+            full_output.append("Final output:")
+            full_output.append(final_output['data'])
+        
+        # Destroy console
+        console.destroy()
+        
+        result = f"Module '{module_name}' executed against {target_ip}\n"
+        result += "Console output:\n"
+        result += "\n".join(full_output)
+        
+        return result
         
     except Exception as e:
-        return f"Metasploit auxiliary failed: {str(e)}"
+        import traceback
+        return f"Console execution failed: {str(e)}\nDetails: {traceback.format_exc()}"
    
 @tool
 def run_metasploit_exploit(target_ip: str, module_name: str, payload: str, options: Dict[str, str] = None) -> str:
@@ -431,62 +497,135 @@ def should_continue_scanning(state: ReconState) -> str:
         print(f"  → No more scans needed, moving to vulnerability assessment")
         return "vuln_assessment"
 
+def extract_services_from_text(text: str) -> Dict[str, List[str]]:
+    """Minimal regex-based service extraction as fallback"""
+    import re
+    services = {}
+    
+    # Simple regex to find port/service patterns
+    port_pattern = r'(\d+)/(tcp|udp)\s+open\s+(\S+)'
+    matches = re.findall(port_pattern, text, re.IGNORECASE)
+    
+    for port, protocol, service in matches:
+        if port not in services:
+            services[port] = []
+        services[port].append(f"{service} ({protocol})")
+    
+    return services
 
 # Vulnerability Assessment Node
 def vuln_assessment_node(state: ReconState) -> ReconState:
-    """Assess vulnerabilities using Metasploit auxiliary modules"""
+    """Simplified vulnerability assessment with cleaner prompting"""
     print("Entering vuln_assessment_node")
     state['current_step'] = 'vulnerability_assessment'
+    
+    if 'vulns' not in state:
+        state['vulns'] = []
     
     llm = get_llm(state['llm_provider'], state['api_key'], state['local_model'])
     llm_with_tools = llm.bind_tools(tools)
     
-    system_prompt = """You are a vulnerability assessment specialist.
-    Your task is to verify potential vulnerabilities based on the overall mission plan and the technical scan results.
+    # Get scan results
+    scan_results = state.get('scan_results', {})
     
-    **Mission Plan:** {plan}
+    if not scan_results:
+        print("No scan results available for vulnerability assessment")
+        state['vulns'] = ["No scan results available for vulnerability assessment"]
+        return state
     
-    Based on the plan's objectives and the open ports found, you MUST call the `run_metasploit_auxiliary` tool to investigate the most relevant services."""
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "Assess vulnerabilities for IP: {ip}\nScan results: {scan_results}"),
-        MessagesPlaceholder(variable_name="messages")
-    ])
+    # Prepare scan results summary
+    scan_summary = ""
+    for scan_name, scan_output in scan_results.items():
+        if isinstance(scan_output, str):
+            # Keep it simple - just truncate if too long
+            if len(scan_output) > 1500:
+                scan_output = scan_output[:1500] + "\n[... truncated ...]"
+            scan_summary += f"\n=== {scan_name} ===\n{scan_output}\n"
+
+    # Simpler system prompt without complex formatting
+    system_prompt = f"""You are a vulnerability assessment specialist. 
+
+Your task is to analyze the scan results and run appropriate Metasploit auxiliary modules to test for vulnerabilities.
+
+TARGET IP: {state['ip']}
+
+AVAILABLE MODULES:
+- FTP services: scanner/ftp/ftp_version or scanner/ftp/anonymous  
+- SSH services: scanner/ssh/ssh_version
+- HTTP services: scanner/http/http_version
+- SMB services: scanner/smb/smb_version
+- MySQL services: scanner/mysql/mysql_version
+- Other services: use appropriate scanner modules
+
+INSTRUCTIONS:
+1. Look at the scan results to identify open services
+2. Run 2-3 appropriate auxiliary modules using run_metasploit_auxiliary
+3. For each module call, use this format:
+   - target_ip: the target IP
+   - module_name: exact module name like "scanner/ftp/ftp_version"  
+   - options: a dictionary with any extra options needed
+
+Execute the vulnerability assessment now."""
     
     try:
-        chain = prompt | llm_with_tools
-        response = chain.invoke({
-            "plan": state['plan'],
-            "ip": state['ip'],
-            "scan_results": state['scan_results'],
-            "messages": []
-        })
+        # Use invoke directly instead of complex prompt template
+        messages = [
+            ("system", system_prompt),
+            ("human", f"Analyze these scan results and run vulnerability tests:\n\n{scan_summary}\n\nBased on the open services found, execute appropriate Metasploit auxiliary modules.")
+        ]
         
+        response = llm_with_tools.invoke(messages)
         state['messages'].append(response)
-        print(response)
-        # Execute tool calls if any
+        
         if response.tool_calls:
+            print(f"Executing {len(response.tool_calls)} vulnerability assessment tool calls")
             tool_results = tool_node.invoke({"messages": [response]})
-            
             state['messages'].extend(tool_results['messages'])
             
-            # Extract vulnerability information
-            vulns = []
+            # Extract results
+            results_content = ""
             for msg in tool_results['messages']:
-                if hasattr(msg, 'content') and 'Auxiliary scan completed' in msg.content:
-                    vulns.append(msg.content)
+                if hasattr(msg, 'content'):
+                    results_content += f"{msg.content}\n"
             
-            state['vulns'] = vulns if vulns else ["No vulnerabilities assessed"]
+            # Simple analysis without complex templating
+            analysis_response = llm.invoke([
+                ("human", f"Summarize these vulnerability assessment results:\n\n{results_content}\n\nProvide a brief summary of services tested and any findings.")
+            ])
+            
+            # Store results
+            state['vulns'] = [
+                {
+                    'type': 'assessment_summary',
+                    'content': analysis_response.content,
+                    'severity': 'analysis'
+                },
+                {
+                    'type': 'raw_results', 
+                    'content': results_content,
+                    'severity': 'raw'
+                }
+            ]
+            
         else:
-            state['vulns'] = ["No vulnerability assessment performed"]
+            print("No tool calls made during vulnerability assessment")
+            state['vulns'] = [{
+                'type': 'no_assessment',
+                'content': 'No vulnerability assessment tools were executed',
+                'severity': 'warning'
+            }]
             
     except Exception as e:
         error_msg = f"Vulnerability assessment failed: {str(e)}"
         print(error_msg)
         state['errors'].append(error_msg)
-        state['vulns'] = [error_msg]
+        state['vulns'] = [{
+            'type': 'error',
+            'content': error_msg,
+            'severity': 'error'
+        }]
     
+    print(f"Vulnerability assessment complete. Found {len(state['vulns'])} assessment items")
     return state
 
 # Exploitation Node
@@ -525,7 +664,6 @@ def exploitation_node(state: ReconState) -> ReconState:
             "vulns": state['vulns'],
             "messages": []
         })
-        print(response)
         state['messages'].append(response)
         
         # Execute tool calls if any
