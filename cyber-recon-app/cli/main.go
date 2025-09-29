@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/urfave/cli/v2"
 )
@@ -52,7 +51,7 @@ func (c *LLMConfig) Validate() []ValidationError {
 			Message: "provider is required",
 		})
 
-	// Validate provider for validity
+		// Validate provider for validity
 	} else {
 		validProviders := []string{"ollama", "openai", "anthropic", "gemini", "grok"}
 		if !llmpPoviderContains(validProviders, c.Provider) {
@@ -71,7 +70,7 @@ func (c *LLMConfig) Validate() []ValidationError {
 			Message: "api_key is required",
 		})
 
-	// Validate api_key for validity (if less than 12 most likeley a placeholder)
+		// Validate api_key for validity (if less than 12 most likeley a placeholder)
 	} else if len(c.APIKey) < 8 {
 		errors = append(errors, ValidationError{
 			Field:   "api_key",
@@ -148,8 +147,8 @@ func main() {
 	app := &cli.App{
 		Name:  "HADES",
 		Usage: "This tool is designed for reconnaissance and, under ideal circumstances, can establish a shell. At the very least, it will generate a detailed report.",
-		
-		//Defining main command and supporting arguments 
+
+		//Defining main command and supporting arguments
 		Commands: []*cli.Command{
 			{
 				Name: "recon",
@@ -241,10 +240,37 @@ func main() {
 					msgs, err := ch.Consume("recon_results", "", true, false, false, false, nil)
 					if err != nil {
 						failOnError(err, "Failed to consume message")
-						return nil
+						return err
 					}
+
 					for d := range msgs {
-						fmt.Printf("Received: %s\n", d.Body)
+						// Create filename with IP and timestamp
+						timestamp := time.Now().Format("2006-01-02_15-04-05")
+						filename := fmt.Sprintf("../reports/recon_%s_%s.json", c.String("ip"), timestamp)
+
+						// Unmarshal the JSON to validate and reformat
+						var data interface{}
+						err := json.Unmarshal(d.Body, &data)
+						if err != nil {
+							failOnError(err, "Failed to unmarshal JSON")
+							return err
+						}
+
+						// Marshal the JSON with indentation for pretty-printing
+						prettyJSON, err := json.MarshalIndent(data, "", "  ")
+						if err != nil {
+							failOnError(err, "Failed to marshal JSON")
+							return err
+						}
+
+						// Save the pretty-printed JSON to file
+						err = os.WriteFile(filename, prettyJSON, 0644)
+						if err != nil {
+							failOnError(err, "Failed to write to file")
+							return err
+						}
+
+						fmt.Printf("Results saved to %s\n", filename)
 						break
 					}
 					return nil

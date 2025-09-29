@@ -14,16 +14,7 @@ logger = logging.getLogger(__name__)
 
 def process_recon(data):
     """
-    Process reconnaissance request using LangGraph workflow
-    
-    Expected data format:
-    {
-        "ip": "192.168.1.1",
-        "user_input": "Comprehensive security assessment",
-        "llm_provider": "openai",
-        "api_key": "your-api-key",
-        "local_model": "llama2"  # Optional, for ollama
-    }
+    Process reconnaissance request using LangGraph workflow.
     """
     logger.info(f"Starting reconnaissance for IP: {data.get('ip', 'Unknown')}")
     

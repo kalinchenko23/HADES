@@ -1,12 +1,10 @@
 from pymetasploit3.msfrpc import MsfRpcClient
 
-# --- CONFIGURATION ---
-MSF_HOST = '192.168.34.131' # <-- IMPORTANT: Put your VM's IP here!
+MSF_HOST = '192.168.34.133' # <-- IMPORTANT: Put your VM's IP here!
 MSF_PORT = 55553
 MSF_USER = 'msf'
 MSF_PASS = 'my-super-secret-password'
 USE_SSL = True
-# --- END CONFIGURATION ---
 
 print(f"Attempting to connect to {MSF_HOST}:{MSF_PORT}...")
 
